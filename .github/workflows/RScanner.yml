@@ -42,7 +42,8 @@ jobs:
           echo "=> Updating package lists..."
           sudo apt-get update -y
           echo "=> Installing required packages..."
-          sudo apt-get install -y jq curl netcat-openbsd build-essential pkg-config libssl-dev ca-certificates coreutils
+          # Added 'shuf' for the randomization logic
+          sudo apt-get install -y jq curl netcat-openbsd build-essential pkg-config libssl-dev ca-certificates coreutils shuf
 
       - name: Restore Best IP Cache
         uses: actions/cache@v4
@@ -88,7 +89,7 @@ jobs:
             exit 1
           fi
 
-      - name: Run scanner and select best IP (Lowest Ping)
+      - name: Run scanner and select best IP (Randomized Top 20)
         id: scan
         timeout-minutes: 15
         run: |
@@ -139,8 +140,6 @@ jobs:
           cp "$SCAN_OUT" "$LOG" || true
 
           # Parse lines containing "PROXY LIVE" (case-insensitive) and extract latency(ms) and IP.
-          # This awk script finds lines with "PROXY LIVE", extracts the ping time (e.g., "(123 ms)"), 
-          # and the IP address. This matches your screenshots.
           awk 'BEGIN{IGNORECASE=1}
             /PROXY[[:space:]]+LIVE/ {
               # extract latency in ms from "(123 ms)" or "(123ms)"
@@ -173,11 +172,27 @@ jobs:
 
           CANDIDATES_COUNT=$(wc -l < "$CANDIDATES" 2>/dev/null || echo 0)
           echo "=> Found ${CANDIDATES_COUNT} valid candidate IPs"
+          
           if [ "$CANDIDATES_COUNT" -gt 0 ]; then
-            # Choose best (lowest latency) — first line after numeric sort
-            BEST_LATENCY=$(awk 'NR==1{print $1}' "$CANDIDATES" || true)
-            BEST_IP=$(awk 'NR==1{print $2}' "$CANDIDATES" || true)
-            echo "🎯 Best IP selected (lowest ping): ${BEST_IP} with ${BEST_LATENCY}ms"
+            # ---!!! Smart Customization !!!---
+            # As requested, select a VARIABLE IP from the Top list
+            # to avoid filtering, not just the #1.
+            echo "=> Selecting one random IP from the top ${CANDIDATES_COUNT} candidates..."
+            SELECTED_LINE=$(shuf -n 1 "$CANDIDATES" || true)
+            
+            if [ -n "$SELECTED_LINE" ]; then
+              BEST_LATENCY=$(echo "$SELECTED_LINE" | awk '{print $1}' || true)
+              BEST_IP=$(echo "$SELECTED_LINE" | awk '{print $2}' || true)
+              echo "🎯 Randomly selected high-speed IP: ${BEST_IP} (Ping: ${BEST_LATENCY}ms)"
+            else
+              echo "⚠️ Random selection failed, falling back to #1..."
+              BEST_LATENCY=$(awk 'NR==1{print $1}' "$CANDIDATES" || true)
+              BEST_IP=$(awk 'NR==1{print $2}' "$CANDIDATES" || true)
+              if [ -n "${BEST_IP}" ]; then
+                 echo "🎯 Best IP selected (lowest ping): ${BEST_IP} with ${BEST_LATENCY}ms"
+              fi
+            fi
+            # ---!!! End Customization !!!---
           else
             BEST_IP=""
             BEST_LATENCY=""
@@ -268,7 +283,7 @@ jobs:
             curl -s -D - -H "${AUTH_HEADER}" "${API_BASE}/accounts/${ACCOUNT_ID}/storage/kv/namespaces" || true
             exit 1
           }
-          if ! echo "$ns_list" | jq -e --arg nsid "$NAMESPACE_ID" '.result[] | select(.id==$nsid)' >/dev/null 2>&1; then
+          if ! echo "$ns_list" | jq -e --arg nsid "$NAMESPACE_ID" '.result[] | select(.id==$nsid)' >/dev/null 2>&1; then.
             echo "❌ ERROR: Namespace ID ${NAMESPACE_ID} not found in account ${ACCOUNT_ID}"
             echo "=> Available namespaces (first 20):"
             echo "$ns_list" | jq -r '.result[] | "\(.id)\t\(.title)"' | head -n 20 || true
@@ -288,7 +303,7 @@ jobs:
             attempt=$((attempt+1))
             echo "=> PUT attempt $attempt/$max_attempts..."
             http_status=$(curl -s -o /tmp/cf_put_resp -w "%{http_code}" -X PUT \
-              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Authorization: Bearter ${CF_API_TOKEN}" \
               -H "Content-Type: text/plain" \
               --data-binary "${VALUE}" \
               "${put_url}" || echo "000")
