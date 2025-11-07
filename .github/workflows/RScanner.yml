@@ -1,86 +1,71 @@
 name: Rust Proxy Scanner (Ultimate KV + Git)
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: '0 */24 * * *'  # Every 24 hours
+    - cron: '0 */6 * * *'  # Run every 6 hours
+  workflow_dispatch:  # Allow manual trigger
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/RScanner.yml'
 
 env:
-  CARGO_TERM_COLOR: always
-  CACHE_FILE: .cachelastbestip.txt
-  RUST_CACHE_KEY: v4
-  SCAN_BINARY: ./target/release/RScanner
-  SCAN_LOG: scan.log
-  SCANNER_TIMEOUT: "600"
-  MAX_CF_RETRIES: "5"
-  CF_RETRY_BASE_SLEEP: "2"
+  SCAN_BINARY: './proxy-scanner'
+  SCAN_LOG: 'scan_results.log'
+  CACHE_FILE: '.proxy_cache'
+  SCANNER_TIMEOUT: 600  # 10 minutes timeout
 
 jobs:
   scan-and-update:
-    name: Scan Proxies → Update KV → Commit to Git
+    name: Scan Proxies and Update KV
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    
+    permissions:
+      contents: write  # Required for git operations
     
     steps:
-      # ========== Step 1: Environment Setup ==========
+      # ========== Step 1: Checkout Repository ==========
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install System Dependencies
+      # ========== Step 2: Setup Dependencies ==========
+      - name: Setup Dependencies
         run: |
           set -euo pipefail
-          echo "🔧 Installing system packages..."
-          sudo apt-get update -y
-          sudo apt-get install -y jq curl netcat-openbsd build-essential \
-            pkg-config libssl-dev ca-certificates coreutils
-          echo "✅ System dependencies installed"
+          echo "📦 Installing required packages..."
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl jq wget
+          echo "✅ Dependencies installed"
 
-      # ========== Step 2: Rust Installation and Cache ==========
-      - name: Install Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-
-      - name: Cache Rust Dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ env.RUST_CACHE_KEY }}-${{ runner.os }}
-          cache-on-failure: true
-
-      - name: Restore Best IP Cache
-        uses: actions/cache@v4
-        id: ip-cache
-        with:
-          path: ${{ env.CACHE_FILE }}
-          key: rust-proxy-scanner-best-ip-${{ env.RUST_CACHE_KEY }}-${{ runner.os }}
-          restore-keys: |
-            rust-proxy-scanner-best-ip-${{ env.RUST_CACHE_KEY }}-
-            rust-proxy-scanner-best-ip-
-
-      # ========== Step 3: Build Project ==========
-      - name: Build Rust Project (Release)
+      # ========== Step 3: Prepare Scanner Binary ==========
+      - name: Prepare Scanner Binary
         run: |
           set -euo pipefail
-          echo "🔨 Building Rust project in release mode..."
-          if ! cargo build --release 2>&1 | tee build-output.log; then
-            echo "❌ Build failed! Last 200 lines:"
-            tail -n 200 build-output.log || true
-            exit 1
-          fi
-          echo "✅ Build completed successfully"
+          echo "🔧 Preparing scanner binary..."
           
-          # Check binary exists
-          if [ ! -f "${{ env.SCAN_BINARY }}" ]; then
-            echo "❌ ERROR: Binary not found at ${{ env.SCAN_BINARY }}"
-            ls -lah target/release/ || true
+          # Check if binary exists in repository
+          if [ -f "${{ env.SCAN_BINARY }}" ]; then
+            echo "✅ Binary found in repository"
+          else
+            echo "❌ Scanner binary not found: ${{ env.SCAN_BINARY }}"
+            echo "Please ensure the binary is committed to the repository"
             exit 1
           fi
           
+          # Make binary executable
           chmod +x "${{ env.SCAN_BINARY }}"
-          echo "✅ Binary ready: ${{ env.SCAN_BINARY }}"
+          
+          # Verify binary is executable
+          if [ -x "${{ env.SCAN_BINARY }}" ]; then
+            echo "✅ Binary ready: ${{ env.SCAN_BINARY }}"
+          else
+            echo "❌ Failed to make binary executable"
+            exit 1
+          fi
 
       # ========== Step 4: Run Scanner and Select Best IP ==========
       - name: Run Scanner and Select Best IP
@@ -95,58 +80,70 @@ jobs:
           CACHE_FILE="${{ env.CACHE_FILE }}"
           TIMEOUT="${{ env.SCANNER_TIMEOUT }}"
           
-          # Create temporary files
+          # Create temporary directory for processing
           TMPDIR=$(mktemp -d)
           CANDIDATES="$TMPDIR/candidates.txt"
           SCAN_OUT="$TMPDIR/scan_out.log"
           
+          # Cleanup function
           cleanup() {
             rm -rf "$TMPDIR" || true
           }
           trap cleanup EXIT
           
-          # Run scanner with timeout
+          # Run scanner with timeout protection
           set +e
           echo "⏱️  Running scanner (timeout: ${TIMEOUT}s)..."
           timeout "${TIMEOUT}s" "$BIN" > "$SCAN_OUT" 2>&1
           SCANNER_EXIT_CODE=$?
           set -e
           
-          # Check execution result
+          # Interpret scanner exit code
           if [ "$SCANNER_EXIT_CODE" -eq 0 ]; then
             echo "✅ Scanner completed successfully"
           elif [ "$SCANNER_EXIT_CODE" -eq 124 ]; then
             echo "⚠️  Scanner timed out (will use partial results)"
           else
-            echo "⚠️  Scanner exited with code ${SCANNER_EXIT_CODE} (will try to parse results)"
+            echo "⚠️  Scanner exited with code ${SCANNER_EXIT_CODE} (attempting to parse results)"
           fi
           
-          # Save complete output
+          # Save complete scanner output to log file
           cp "$SCAN_OUT" "$LOG" || true
           
-          # Parse results and find best IP
+          # Parse scanner results to find live proxies
           echo "📊 Parsing scan results..."
           
-          # Extract live IPs with ping
+          # Extract all live proxies with their ping times
+          # Expected format: "PROXY LIVE: 1.2.3.4 (50 ms)"
           grep -E "PROXY LIVE.*\([0-9]+ ms\)" "$SCAN_OUT" | \
             grep -oE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+.*\([0-9]+ ms\)" > "$CANDIDATES" || true
           
+          # Initialize variables
+          TOTAL_COUNT=0
+          BEST_IP=""
+          BEST_PING=""
+          
+          # Check if we found any live proxies
           if [ ! -s "$CANDIDATES" ]; then
-            echo "❌ No live proxies found!"
+            echo "❌ No live proxies found in scan results!"
+            
+            # Try to use cached IP from previous successful run
             if [ -f "$CACHE_FILE" ] && [ -s "$CACHE_FILE" ]; then
               echo "📦 Using cached IP from previous run"
               BEST_IP=$(cat "$CACHE_FILE")
               BEST_PING="cached"
+              TOTAL_COUNT=0
             else
-              echo "❌ No cached IP available either"
+              echo "❌ No cached IP available"
+              echo "Cannot proceed without a valid proxy IP"
               exit 1
             fi
           else
-            # Sort by ping and select best
+            # Count total live proxies found
             TOTAL_COUNT=$(wc -l < "$CANDIDATES")
             echo "📈 Found ${TOTAL_COUNT} live proxies"
             
-            # Extract IP and ping, then sort
+            # Extract IP addresses and ping times, then sort by ping (lowest first)
             awk '{
               match($0, /([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+).*\(([0-9]+) ms\)/, arr)
               if (arr[1] && arr[2]) {
@@ -154,24 +151,35 @@ jobs:
               }
             }' "$CANDIDATES" | sort -n | head -1 > "$TMPDIR/best.txt"
             
+            # Read the best proxy (lowest ping)
             if [ -s "$TMPDIR/best.txt" ]; then
               read BEST_PING BEST_IP < "$TMPDIR/best.txt"
               echo "🏆 Best IP selected: $BEST_IP (ping: ${BEST_PING}ms)"
               
-              # Save to cache
+              # Cache the best IP for future use
               echo "$BEST_IP" > "$CACHE_FILE"
+              echo "💾 IP cached to: $CACHE_FILE"
             else
-              echo "❌ Failed to parse best IP"
+              echo "❌ Failed to parse best IP from results"
               exit 1
             fi
           fi
           
-          # Output for use in next steps
-          echo "bestip=$BEST_IP" >> $GITHUB_OUTPUT
-          echo "bestping=$BEST_PING" >> $GITHUB_OUTPUT
-          echo "total_proxies=$TOTAL_COUNT" >> $GITHUB_OUTPUT
+          # Validate IP address format
+          if ! echo "$BEST_IP" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "❌ Invalid IP address format: $BEST_IP"
+            exit 1
+          fi
           
-          echo "✅ Scan completed - Best IP: $BEST_IP"
+          # Set outputs for next steps
+          echo "bestip=$BEST_IP" >> "$GITHUB_OUTPUT"
+          echo "bestping=$BEST_PING" >> "$GITHUB_OUTPUT"
+          echo "total_proxies=$TOTAL_COUNT" >> "$GITHUB_OUTPUT"
+          
+          echo "✅ Scan completed successfully"
+          echo "   Best IP: $BEST_IP"
+          echo "   Ping: ${BEST_PING}ms"
+          echo "   Total proxies: $TOTAL_COUNT"
 
       # ========== Step 5: Update Cloudflare KV ==========
       - name: Update Cloudflare KV with Best IP
@@ -183,129 +191,143 @@ jobs:
         run: |
           set -euo pipefail
           
+          # Get outputs from scan step
           BEST_IP="${{ steps.scan.outputs.bestip }}"
           BEST_PING="${{ steps.scan.outputs.bestping }}"
           TOTAL="${{ steps.scan.outputs.total_proxies }}"
           
+          # Validate we have an IP to update
           if [ -z "$BEST_IP" ]; then
-            echo "❌ No IP to update in KV"
+            echo "❌ No IP address to update in Cloudflare KV"
+            exit 1
+          fi
+          
+          # Validate required Cloudflare credentials
+          if [ -z "$CF_ACCOUNT_ID" ] || [ -z "$CF_API_TOKEN" ] || [ -z "$CF_NAMESPACE_ID" ]; then
+            echo "❌ Missing required Cloudflare credentials"
+            echo "Please ensure CF_ACCOUNT_ID, CF_API_TOKEN, and CF_NAMESPACE_ID secrets are set"
             exit 1
           fi
           
           echo "🔐 Updating Cloudflare KV..."
-          echo "   Account: ${CF_ACCOUNT_ID:0:8}..."
-          echo "   Namespace: ${CF_NAMESPACE_ID:0:8}..."
+          echo "   Account ID: ${CF_ACCOUNT_ID:0:8}..."
+          echo "   Namespace ID: ${CF_NAMESPACE_ID:0:8}..."
           echo "   Key: $CF_KV_KEY"
-          echo "   Value: $BEST_IP (${BEST_PING}ms from ${TOTAL} proxies)"
+          echo "   Value: $BEST_IP (${BEST_PING}ms, ${TOTAL} proxies scanned)"
           
-          # Create metadata
+          # Create metadata for the KV entry
           TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           METADATA=$(jq -n \
             --arg ip "$BEST_IP" \
             --arg ping "$BEST_PING" \
             --arg total "$TOTAL" \
-            --arg time "$TIMESTAMP" \
+            --arg timestamp "$TIMESTAMP" \
+            --arg workflow "${{ github.run_id }}" \
             '{
               ip: $ip,
               ping_ms: $ping,
-              total_scanned: $total,
-              updated_at: $time,
-              source: "github_actions"
+              total_proxies: $total,
+              updated_at: $timestamp,
+              github_run_id: $workflow,
+              source: "github-actions"
             }')
           
-          # Update KV with retry logic
-          MAX_RETRIES=${{ env.MAX_CF_RETRIES }}
-          RETRY_SLEEP=${{ env.CF_RETRY_BASE_SLEEP }}
+          echo "📝 Metadata: $METADATA"
           
-          for i in $(seq 1 $MAX_RETRIES); do
-            echo "🔄 Attempt $i/$MAX_RETRIES..."
+          # Prepare the request payload
+          PAYLOAD=$(jq -n \
+            --arg key "$CF_KV_KEY" \
+            --arg value "$BEST_IP" \
+            --argjson metadata "$METADATA" \
+            '[{
+              key: $key,
+              value: $value,
+              metadata: $metadata
+            }]')
+          
+          # Update Cloudflare KV using bulk write API
+          RESPONSE=$(curl -s -X PUT \
+            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_NAMESPACE_ID}/bulk" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$PAYLOAD")
+          
+          # Check if the API call was successful
+          SUCCESS=$(echo "$RESPONSE" | jq -r '.success // false')
+          
+          if [ "$SUCCESS" = "true" ]; then
+            echo "✅ Cloudflare KV updated successfully"
+            echo "   Key: $CF_KV_KEY = $BEST_IP"
+          else
+            echo "❌ Failed to update Cloudflare KV"
+            echo "Response: $RESPONSE"
             
-            HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/cf_response.json \
-              -X PUT \
-              "https://api.cloudflare.com/v1/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_NAMESPACE_ID}/values/${CF_KV_KEY}" \
-              -H "Authorization: Bearer ${CF_API_TOKEN}" \
-              -H "Content-Type: text/plain" \
-              --data-raw "$BEST_IP")
-            
-            if [ "$HTTP_CODE" = "200" ]; then
-              echo "✅ Cloudflare KV updated successfully!"
-              echo "📋 Response:"
-              cat /tmp/cf_response.json | jq '.' || cat /tmp/cf_response.json
-              break
-            else
-              echo "⚠️  Request failed with HTTP $HTTP_CODE"
-              cat /tmp/cf_response.json || true
-              
-              if [ $i -lt $MAX_RETRIES ]; then
-                SLEEP_TIME=$((RETRY_SLEEP * i))
-                echo "⏳ Waiting ${SLEEP_TIME}s before retry..."
-                sleep $SLEEP_TIME
-              else
-                echo "❌ Failed to update KV after $MAX_RETRIES attempts"
-                exit 1
-              fi
+            # Extract error messages if available
+            ERRORS=$(echo "$RESPONSE" | jq -r '.errors[]?.message // empty' 2>/dev/null || echo "Unknown error")
+            if [ -n "$ERRORS" ]; then
+              echo "Errors: $ERRORS"
             fi
-          done
-          
-          # Save metadata to separate file (optional)
-          echo "$METADATA" > kv-metadata.json
-          echo "💾 Metadata saved to kv-metadata.json"
+            exit 1
+          fi
 
-      # ========== Step 6: Commit Results to Git ==========
-      - name: Commit and Push Results
-        if: success()
+      # ========== Step 6: Commit Results to Repository ==========
+      - name: Commit Scan Results
         run: |
           set -euo pipefail
           
-          echo "📝 Committing scan results..."
+          echo "📝 Committing scan results to repository..."
           
-          # Configure Git
-          git config --global user.name "NET-Sentinel Bot"
-          git config --global user.email "224584266+NetSentinel-Bot@users.noreply.github.com"
+          # Configure git
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
           
-          # Add changed files
-          git add sub/ProxyIP-Daily.md || true
-          git add "${{ env.SCAN_LOG }}" || true
-          git add "${{ env.CACHE_FILE }}" || true
-          git add kv-metadata.json || true
+          # Add files to git
+          git add "${{ env.SCAN_LOG }}" "${{ env.CACHE_FILE }}" || true
           
-          # Check for changes
-          if git diff --cached --quiet; then
+          # Check if there are changes to commit
+          if git diff --staged --quiet; then
             echo "ℹ️  No changes to commit"
           else
-            UTC_TIME=$(date -u '+%Y-%m-%d %H:%M:%S')
+            # Commit with detailed message
             BEST_IP="${{ steps.scan.outputs.bestip }}"
-            COMMIT_MSG="🔄 Proxy scan completed at ${UTC_TIME} UTC
-          
-          Best IP: ${BEST_IP} (${{{ steps.scan.outputs.bestping }}}ms)
-          Total scanned: ${{ steps.scan.outputs.total_proxies }} proxies
-          Updated: Cloudflare KV + GitHub"
+            BEST_PING="${{ steps.scan.outputs.bestping }}"
+            TOTAL="${{ steps.scan.outputs.total_proxies }}"
+            TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
             
-            git commit -m "$COMMIT_MSG"
+            git commit -m "🤖 Auto-update: Best proxy IP" \
+                       -m "IP: $BEST_IP" \
+                       -m "Ping: ${BEST_PING}ms" \
+                       -m "Total proxies: $TOTAL" \
+                       -m "Updated: $TIMESTAMP" \
+                       -m "Run: ${{ github.run_id }}"
             
-            # Sign commit with separate information
-            git -c committer.name="Diana-Cl" \
-                -c committer.email="135276904+Diana-Cl@users.noreply.github.com" \
-                commit --amend --no-edit
-            
-            # Push with force
-            echo "⬆️  Pushing to GitHub..."
-            git push origin main --force
-            
-            echo "✅ Results committed and pushed successfully"
+            # Push changes
+            git push
+            echo "✅ Results committed and pushed to repository"
           fi
 
-      # ========== Step 7: Final Summary ==========
-      - name: Summary
+      # ========== Step 7: Create Summary ==========
+      - name: Generate Job Summary
         if: always()
         run: |
-          echo "═══════════════════════════════════════"
-          echo "        🎯 WORKFLOW SUMMARY 🎯"
-          echo "═══════════════════════════════════════"
-          echo "Best IP:      ${{ steps.scan.outputs.bestip }}"
-          echo "Ping:         ${{ steps.scan.outputs.bestping }}ms"
-          echo "Total Scans:  ${{ steps.scan.outputs.total_proxies }}"
-          echo "KV Updated:   ✅"
-          echo "Git Pushed:   ✅"
-          echo "Time:         $(date -u '+%Y-%m-%d %H:%M:%S') UTC"
-          echo "═══════════════════════════════════════"
+          echo "# 🔍 Proxy Scanner Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          
+          if [ "${{ steps.scan.outcome }}" = "success" ]; then
+            BEST_IP="${{ steps.scan.outputs.bestip }}"
+            BEST_PING="${{ steps.scan.outputs.bestping }}"
+            TOTAL="${{ steps.scan.outputs.total_proxies }}"
+            
+            echo "## ✅ Scan Successful" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+            echo "| **Best IP** | \`$BEST_IP\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| **Ping** | ${BEST_PING}ms |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| **Total Proxies** | $TOTAL |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| **Timestamp** | $(date -u +"%Y-%m-%d %H:%M:%S UTC") |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## ❌ Scan Failed" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "The proxy scan did not complete successfully. Check the logs for details." >> "$GITHUB_STEP_SUMMARY"
+          fi
