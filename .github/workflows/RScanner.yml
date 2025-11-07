@@ -42,10 +42,8 @@ jobs:
           echo "=> Updating package lists..."
           sudo apt-get update -y
           echo "=> Installing required packages..."
-          # ---!!! FIXED !!!---
-          # Removed 'shuf' as it's included in 'coreutils'
+          # coreutils provides 'shuf'
           sudo apt-get install -y jq curl netcat-openbsd build-essential pkg-config libssl-dev ca-certificates coreutils
-          # ---------------------
 
       - name: Restore Best IP Cache
         uses: actions/cache@v4
@@ -74,10 +72,11 @@ jobs:
             rust-cache-${{ env.RUST_CACHE_KEY }}-${{ runner.os }}-
 
       - name: Build Rust project (release)
+        # ---!!! FIX APPLIED HERE: Added --locked !!!---
         run: |
           set -euo pipefail
-          echo "=> Starting cargo build --release"
-          if ! cargo build --release 2>&1 | tee build-output.log; then
+          echo "=> Starting cargo build --release --locked"
+          if ! cargo build --release --locked 2>&1 | tee build-output.log; then
             echo "❌ Cargo build failed. Showing last 200 lines:"
             tail -n 200 build-output.log || true
             exit 1
@@ -90,6 +89,7 @@ jobs:
             echo "❌ ERROR: Scanner binary not found at ${{ env.SCAN_BINARY }}"
             exit 1
           fi
+        # ---------------------------------------------
 
       - name: Run scanner and select best IP (Randomized Top 20)
         id: scan
