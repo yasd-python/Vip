@@ -42,8 +42,10 @@ jobs:
           echo "=> Updating package lists..."
           sudo apt-get update -y
           echo "=> Installing required packages..."
-          # Added 'shuf' for the randomization logic
-          sudo apt-get install -y jq curl netcat-openbsd build-essential pkg-config libssl-dev ca-certificates coreutils shuf
+          # ---!!! FIXED !!!---
+          # Removed 'shuf' as it's included in 'coreutils'
+          sudo apt-get install -y jq curl netcat-openbsd build-essential pkg-config libssl-dev ca-certificates coreutils
+          # ---------------------
 
       - name: Restore Best IP Cache
         uses: actions/cache@v4
@@ -175,8 +177,7 @@ jobs:
           
           if [ "$CANDIDATES_COUNT" -gt 0 ]; then
             # ---!!! Smart Customization !!!---
-            # As requested, select a VARIABLE IP from the Top list
-            # to avoid filtering, not just the #1.
+            # Select a VARIABLE IP from the Top list to avoid filtering.
             echo "=> Selecting one random IP from the top ${CANDIDATES_COUNT} candidates..."
             SELECTED_LINE=$(shuf -n 1 "$CANDIDATES" || true)
             
@@ -210,7 +211,7 @@ jobs:
                 if [ "$octet" -lt 0 ] || [ "$octet" -gt 255 ]; then
                   VALID=false
                   break
-                fi
+                end
               done
               if [ "$VALID" = true ]; then
                 BEST_IP="$CACHED_IP"
@@ -248,11 +249,7 @@ jobs:
       - name: Update Cloudflare KV via Cloudflare REST API (curl) with verification & retries
         id: update-kv
         env:
-          # ---!!! FIX !!!---
-          # This is the corrected part. It takes the 'bestip' from the 'scan' step
-          # and passes it as CF_VAR_VALUE to the update script.
           CF_VAR_VALUE: ${{ steps.scan.outputs.bestip }}
-          # ---------------------
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
@@ -283,7 +280,7 @@ jobs:
             curl -s -D - -H "${AUTH_HEADER}" "${API_BASE}/accounts/${ACCOUNT_ID}/storage/kv/namespaces" || true
             exit 1
           }
-          if ! echo "$ns_list" | jq -e --arg nsid "$NAMESPACE_ID" '.result[] | select(.id==$nsid)' >/dev/null 2>&1; then.
+          if ! echo "$ns_list" | jq -e --arg nsid "$NAMESPACE_ID" '.result[] | select(.id==$nsid)' >/dev/null 2>&1; then
             echo "❌ ERROR: Namespace ID ${NAMESPACE_ID} not found in account ${ACCOUNT_ID}"
             echo "=> Available namespaces (first 20):"
             echo "$ns_list" | jq -r '.result[] | "\(.id)\t\(.title)"' | head -n 20 || true
@@ -303,7 +300,7 @@ jobs:
             attempt=$((attempt+1))
             echo "=> PUT attempt $attempt/$max_attempts..."
             http_status=$(curl -s -o /tmp/cf_put_resp -w "%{http_code}" -X PUT \
-              -H "Authorization: Bearter ${CF_API_TOKEN}" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
               -H "Content-Type: text/plain" \
               --data-binary "${VALUE}" \
               "${put_url}" || echo "000")
