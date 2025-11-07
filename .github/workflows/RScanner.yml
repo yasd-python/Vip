@@ -3,7 +3,7 @@ name: Rust Proxy Scanner (Ultimate KV + Git)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */24 * * *'  # هر 24 ساعت یکبار
+    - cron: '0 */24 * * *'  # Every 24 hours
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 60
     
     steps:
-      # ========== مرحله 1: آماده‌سازی محیط ==========
+      # ========== Step 1: Environment Setup ==========
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
@@ -38,7 +38,7 @@ jobs:
             pkg-config libssl-dev ca-certificates coreutils
           echo "✅ System dependencies installed"
 
-      # ========== مرحله 2: نصب و کش Rust ==========
+      # ========== Step 2: Rust Installation and Cache ==========
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -60,7 +60,7 @@ jobs:
             rust-proxy-scanner-best-ip-${{ env.RUST_CACHE_KEY }}-
             rust-proxy-scanner-best-ip-
 
-      # ========== مرحله 3: ساخت پروژه ==========
+      # ========== Step 3: Build Project ==========
       - name: Build Rust Project (Release)
         run: |
           set -euo pipefail
@@ -72,7 +72,7 @@ jobs:
           fi
           echo "✅ Build completed successfully"
           
-          # بررسی وجود فایل باینری
+          # Check binary exists
           if [ ! -f "${{ env.SCAN_BINARY }}" ]; then
             echo "❌ ERROR: Binary not found at ${{ env.SCAN_BINARY }}"
             ls -lah target/release/ || true
@@ -82,7 +82,7 @@ jobs:
           chmod +x "${{ env.SCAN_BINARY }}"
           echo "✅ Binary ready: ${{ env.SCAN_BINARY }}"
 
-      # ========== مرحله 4: اجرای اسکنر و انتخاب بهترین IP ==========
+      # ========== Step 4: Run Scanner and Select Best IP ==========
       - name: Run Scanner and Select Best IP
         id: scan
         timeout-minutes: 15
@@ -95,7 +95,7 @@ jobs:
           CACHE_FILE="${{ env.CACHE_FILE }}"
           TIMEOUT="${{ env.SCANNER_TIMEOUT }}"
           
-          # ایجاد فایل‌های موقت
+          # Create temporary files
           TMPDIR=$(mktemp -d)
           CANDIDATES="$TMPDIR/candidates.txt"
           SCAN_OUT="$TMPDIR/scan_out.log"
@@ -105,14 +105,14 @@ jobs:
           }
           trap cleanup EXIT
           
-          # اجرای اسکنر با timeout
+          # Run scanner with timeout
           set +e
           echo "⏱️  Running scanner (timeout: ${TIMEOUT}s)..."
           timeout "${TIMEOUT}s" "$BIN" > "$SCAN_OUT" 2>&1
           SCANNER_EXIT_CODE=$?
           set -e
           
-          # بررسی نتیجه اجرا
+          # Check execution result
           if [ "$SCANNER_EXIT_CODE" -eq 0 ]; then
             echo "✅ Scanner completed successfully"
           elif [ "$SCANNER_EXIT_CODE" -eq 124 ]; then
@@ -121,13 +121,13 @@ jobs:
             echo "⚠️  Scanner exited with code ${SCANNER_EXIT_CODE} (will try to parse results)"
           fi
           
-          # ذخیره خروجی کامل
+          # Save complete output
           cp "$SCAN_OUT" "$LOG" || true
           
-          # پارس کردن نتایج و یافتن بهترین IP
+          # Parse results and find best IP
           echo "📊 Parsing scan results..."
           
-          # استخراج IP های زنده با پینگ
+          # Extract live IPs with ping
           grep -E "PROXY LIVE.*\([0-9]+ ms\)" "$SCAN_OUT" | \
             grep -oE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+.*\([0-9]+ ms\)" > "$CANDIDATES" || true
           
@@ -142,11 +142,11 @@ jobs:
               exit 1
             fi
           else
-            # مرتب‌سازی بر اساس پینگ و انتخاب بهترین
+            # Sort by ping and select best
             TOTAL_COUNT=$(wc -l < "$CANDIDATES")
             echo "📈 Found ${TOTAL_COUNT} live proxies"
             
-            # استخراج IP و پینگ، سپس مرتب‌سازی
+            # Extract IP and ping, then sort
             awk '{
               match($0, /([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+).*\(([0-9]+) ms\)/, arr)
               if (arr[1] && arr[2]) {
@@ -158,7 +158,7 @@ jobs:
               read BEST_PING BEST_IP < "$TMPDIR/best.txt"
               echo "🏆 Best IP selected: $BEST_IP (ping: ${BEST_PING}ms)"
               
-              # ذخیره در کش
+              # Save to cache
               echo "$BEST_IP" > "$CACHE_FILE"
             else
               echo "❌ Failed to parse best IP"
@@ -166,14 +166,14 @@ jobs:
             fi
           fi
           
-          # خروجی برای استفاده در مراحل بعد
+          # Output for use in next steps
           echo "bestip=$BEST_IP" >> $GITHUB_OUTPUT
           echo "bestping=$BEST_PING" >> $GITHUB_OUTPUT
           echo "total_proxies=$TOTAL_COUNT" >> $GITHUB_OUTPUT
           
           echo "✅ Scan completed - Best IP: $BEST_IP"
 
-      # ========== مرحله 5: آپدیت Cloudflare KV ==========
+      # ========== Step 5: Update Cloudflare KV ==========
       - name: Update Cloudflare KV with Best IP
         env:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
@@ -198,7 +198,7 @@ jobs:
           echo "   Key: $CF_KV_KEY"
           echo "   Value: $BEST_IP (${BEST_PING}ms from ${TOTAL} proxies)"
           
-          # ساخت metadata
+          # Create metadata
           TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           METADATA=$(jq -n \
             --arg ip "$BEST_IP" \
@@ -213,7 +213,7 @@ jobs:
               source: "github_actions"
             }')
           
-          # آپدیت KV با retry logic
+          # Update KV with retry logic
           MAX_RETRIES=${{ env.MAX_CF_RETRIES }}
           RETRY_SLEEP=${{ env.CF_RETRY_BASE_SLEEP }}
           
@@ -247,11 +247,11 @@ jobs:
             fi
           done
           
-          # ذخیره metadata در فایل جداگانه (اختیاری)
+          # Save metadata to separate file (optional)
           echo "$METADATA" > kv-metadata.json
           echo "💾 Metadata saved to kv-metadata.json"
 
-      # ========== مرحله 6: Commit نتایج به Git ==========
+      # ========== Step 6: Commit Results to Git ==========
       - name: Commit and Push Results
         if: success()
         run: |
@@ -259,23 +259,23 @@ jobs:
           
           echo "📝 Committing scan results..."
           
-          # تنظیم Git config
+          # Configure Git
           git config --global user.name "NET-Sentinel Bot"
           git config --global user.email "224584266+NetSentinel-Bot@users.noreply.github.com"
           
-          # اضافه کردن فایل‌های تغییر یافته
+          # Add changed files
           git add sub/ProxyIP-Daily.md || true
           git add "${{ env.SCAN_LOG }}" || true
           git add "${{ env.CACHE_FILE }}" || true
           git add kv-metadata.json || true
           
-          # بررسی تغییرات
+          # Check for changes
           if git diff --cached --quiet; then
             echo "ℹ️  No changes to commit"
           else
-            IRAN_TIME=$(TZ='Asia/Tehran' date '+%Y-%m-%d %H:%M:%S')
+            UTC_TIME=$(date -u '+%Y-%m-%d %H:%M:%S')
             BEST_IP="${{ steps.scan.outputs.bestip }}"
-            COMMIT_MSG="🔄 Proxy scan completed at ${IRAN_TIME}
+            COMMIT_MSG="🔄 Proxy scan completed at ${UTC_TIME} UTC
           
           Best IP: ${BEST_IP} (${{{ steps.scan.outputs.bestping }}}ms)
           Total scanned: ${{ steps.scan.outputs.total_proxies }} proxies
@@ -283,19 +283,19 @@ jobs:
             
             git commit -m "$COMMIT_MSG"
             
-            # امضای commit با اطلاعات جداگانه
+            # Sign commit with separate information
             git -c committer.name="Diana-Cl" \
                 -c committer.email="135276904+Diana-Cl@users.noreply.github.com" \
                 commit --amend --no-edit
             
-            # Push با force
+            # Push with force
             echo "⬆️  Pushing to GitHub..."
             git push origin main --force
             
             echo "✅ Results committed and pushed successfully"
           fi
 
-      # ========== مرحله 7: خلاصه نهایی ==========
+      # ========== Step 7: Final Summary ==========
       - name: Summary
         if: always()
         run: |
@@ -307,5 +307,5 @@ jobs:
           echo "Total Scans:  ${{ steps.scan.outputs.total_proxies }}"
           echo "KV Updated:   ✅"
           echo "Git Pushed:   ✅"
-          echo "Time:         $(TZ='Asia/Tehran' date '+%Y-%m-%d %H:%M:%S') (Tehran)"
+          echo "Time:         $(date -u '+%Y-%m-%d %H:%M:%S') UTC"
           echo "═══════════════════════════════════════"
