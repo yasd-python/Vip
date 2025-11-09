@@ -1,13 +1,12 @@
-name: Rust Proxy Scanner - SmartPing Adaptive AI Edition (Hardened V1.0)
+name: Rust Proxy Scanner - SmartPing Adaptive AI (D1 only)
 
-# Triggers: manual dispatch or scheduled every 6 hours
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *' # Runs every 6 hours
+    - cron: '0 */6 * * *' # every 6 hours
 
 concurrency:
-  group: rust-proxy-smartping
+  group: rust-proxy-smartping-d1
   cancel-in-progress: true
 
 permissions:
@@ -15,422 +14,292 @@ permissions:
   actions: write
 
 env:
-  # Primary scanner binary and logging
   SCAN_BINARY: ./target/release/RScanner
   SCAN_LOG: scan.log
-  SCANNER_TIMEOUT: "600"
-
-  # Priority locations list (comma-separated country codes)
+  SCANNER_TIMEOUT: "600"        # seconds
   PRIORITY_LOCATIONS: "US,DE,GB,NL,FR,SG,JP,CA,AU,CH"
-
-  # Number of ICMP ping attempts to measure real network latency
   REAL_PING_TESTS: "3"
-
-  # Caching and retry configuration
-  RUST_CACHE_KEY: v4
-  CACHE_FILE: .cachelastbestip.txt
   MAX_D1_RETRIES: "3"
-  D1_RETRY_BASE_SLEEP: "2"
+  D1_RETRY_SLEEP: "2"
 
 jobs:
   smartping:
-    name: Build → Scan → Real Network Test → Adaptive D1 Update
+    name: Build → Scan → Real Network Test → Update Cloudflare D1 (only)
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 60
 
     steps:
-      # === Checkout ===
       - name: Checkout repository (full)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # === System packages ===
-      - name: Install system dependencies (robust)
+      - name: Install system dependencies
         run: |
           set -euo pipefail
-          echo "=> apt-get update"
           sudo apt-get update -y
+          # essential tools + geoip + ping utility
+          sudo apt-get install -y jq curl geoip-bin build-essential pkg-config libssl-dev ca-certificates coreutils iputils-ping netcat-openbsd
 
-          # Install packages required by the scanner and helper tooling
-          echo "=> Installing packages"
-          sudo apt-get install -y \
-            jq \
-            curl \
-            geoip-bin \
-            build-essential \
-            pkg-config \
-            libssl-dev \
-            ca-certificates \
-            coreutils \
-            iputils-ping \
-            netcat-openbsd
-
-          # Verify geoiplookup is available; fail fast if not installed
-          echo "=> verify geoiplookup"
-          if ! command -v geoiplookup >/dev/null 2>&1; then
-            echo "❌ geoiplookup not found after install"
+          # verify geoiplookup exists
+          if ! command -v geoiplookup &>/dev/null; then
+            echo "❌ geoiplookup not found after install!"
             exit 1
           fi
-          echo "✅ System packages installed"
+          echo "✅ System dependencies installed"
 
-      # === Restore Rust cache ===
-      - name: Restore Rust cache (artifacts & registry)
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust artifacts and registry
         uses: actions/cache@v4
         with:
           path: |
             target
             ~/.cargo/registry
             ~/.cargo/git
-          key: rust-cache-${{ env.RUST_CACHE_KEY }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: rust-cache-v1-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            rust-cache-${{ env.RUST_CACHE_KEY }}-${{ runner.os }}-
+            rust-cache-v1-${{ runner.os }}-
 
-      # === Rust toolchain ===
-      - name: Install Rust toolchain (stable)
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-
-      # === Build scanner ===
       - name: Build Rust scanner (release)
         run: |
           set -euo pipefail
           echo "=> cargo build --release"
           if ! cargo build --release 2>&1 | tee build-output.log; then
-            echo "❌ Cargo build failed, dumping tail"
+            echo "❌ Cargo build failed. Showing last 200 lines:"
             tail -n 200 build-output.log || true
             exit 1
           fi
-          echo "✅ Build succeeded"
-          ls -lah target/release || true
+          ls -lah target/release/ || true
           if [ ! -f "${{ env.SCAN_BINARY }}" ]; then
             echo "❌ Scanner binary not found at ${{ env.SCAN_BINARY }}"
             exit 1
           fi
-          chmod +x "${{ env.SCAN_BINARY }}"
+          echo "✅ Build successful"
 
-      # === Run scanner and extract proxies ===
-      - name: Run scanner + extract proxies (robust parsing)
+      - name: Run scanner & SmartPing scoring (select best) 
         id: scan
         timeout-minutes: 20
         run: |
           set -euo pipefail
-
-          # Local variables
           BIN="${{ env.SCAN_BINARY }}"
           LOG="${{ env.SCAN_LOG }}"
           TMPDIR=$(mktemp -d)
-          OUT="$TMPDIR/out.log"
+          trap 'rm -rf "$TMPDIR"' EXIT
 
-          # Initialize logs
+          LOCS="${{ env.PRIORITY_LOCATIONS }}"
+          TIMEOUT="${{ env.SCANNER_TIMEOUT }}"
+          REAL_PING_TESTS="${{ env.REAL_PING_TESTS }}"
+
           : > "$LOG"
-          : > "$OUT"
+          if [ ! -x "$BIN" ]; then
+            chmod +x "$BIN" || true
+          fi
 
-          echo "=> Running scanner with timeout ${SCANNER_TIMEOUT}s"
-          # Run scanner under a timeout; non-zero exit is tolerated because partial results are valid
-          timeout "${{ env.SCANNER_TIMEOUT }}" "$BIN" > "$OUT" 2>&1 || true
-          cp "$OUT" "$LOG" || true
+          # Run scanner with timeout; allow non-zero exit but capture output
+          echo "=> Running scanner with timeout ${TIMEOUT}s"
+          timeout "${TIMEOUT}s" "$BIN" > "$LOG" 2>&1 || true
+          echo "=> Scanner finished (or timed out). Log saved to $LOG"
 
-          # Parse scanner output for LIVE proxies. This awk block:
-          # - matches lines containing 'PROXY LIVE'
-          # - extracts IPv4 addresses
-          # - extracts latency in ms (supports "123ms", "123 ms") and seconds ("0.123s")
-          # - converts seconds to milliseconds
-          # - validates IPv4 octets
+          # Parse PROXY LIVE lines robustly:
+          # Accept patterns that include an IPv4 and an approximate latency (e.g., "(123ms)" or "(123 ms)")
           awk 'BEGIN{IGNORECASE=1}
             /PROXY[[:space:]]+LIVE/ {
-              # find ip
+              # find first IPv4
               if (match($0, /([0-9]{1,3}(\.[0-9]{1,3}){3})/, ip)) {
-                ipaddr = ip[1]
-              } else next
+                # try to find latency inside parentheses or like "123ms"
+                lat="9999";
+                if (match($0, /\(([[:space:]]*([0-9]+)[[:space:]]*m?s)[[:space:]]*\)/, a)) {
+                  lat = a[2];
+                } else if (match($0, /([0-9]+)[[:space:]]*m?s/, b)) {
+                  lat = b[1];
+                }
+                gsub(/[^0-9]/,"",lat)
+                if (lat+0 <= 0) lat = 9999
+                print lat+0, ip[1]
+              }
+            }' "$LOG" > "$TMPDIR/proxies.txt" || true
 
-              # find latency in ms or s
-              lat = ""
-              if (match($0, /\(([[:space:]]*([0-9]+)[[:space:]]*ms)[[:space:]]*\)/, a)) {
-                lat = a[2]
-              } else if (match($0, /\(([[:space:]]*([0-9]+)[[:space:]]*s)[[:space:]]*\)/, b)) {
-                # seconds -> convert to ms
-                gsub(/[^0-9]/,"",b[2])
-                lat = b[2] * 1000
-              } else if (match($0, /\(([[:space:]]*([0-9]+)[[:space:]]*m?s)[[:space:]]*\)/, c)) {
-                gsub(/[^0-9]/,"",c[2])
-                lat = c[2]
-              } else next
-
-              # final sanity checks for IP octets and latency
-              split(ipaddr, oct, ".")
-              valid=1
-              for (i in oct) if (oct[i] < 0 || oct[i] > 255) valid=0
-              if (valid && lat+0 >= 0) print lat+0, ipaddr
-            }' "$OUT" > "$TMPDIR/proxies_raw.txt" || true
-
-          TOTAL=$(wc -l < "$TMPDIR/proxies_raw.txt" 2>/dev/null || echo 0)
+          TOTAL=$(wc -l < "$TMPDIR/proxies.txt" 2>/dev/null || echo 0)
           echo "=> Found $TOTAL candidate proxies"
 
-          # If no proxies were discovered, emit empty outputs for downstream steps and exit cleanly.
+          # If none, set empty outputs and exit gracefully
           if [ "$TOTAL" -eq 0 ]; then
-            echo "⚠️ No proxies found. Emitting empty outputs."
             echo "bestip=" >> "$GITHUB_OUTPUT"
             echo "location=" >> "$GITHUB_OUTPUT"
             echo "latency=" >> "$GITHUB_OUTPUT"
             echo "realping=" >> "$GITHUB_OUTPUT"
             echo "score=" >> "$GITHUB_OUTPUT"
+            echo "total_proxies=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
-          # Move to final proxies file
-          mv "$TMPDIR/proxies_raw.txt" "$TMPDIR/proxies.txt"
-          echo "::debug::Proxies file:"
-          sed -n '1,20p' "$TMPDIR/proxies.txt" || true
-
-          # Expose useful paths and references for later steps
-          echo "proxies_file=$TMPDIR/proxies.txt" >> "$GITHUB_OUTPUT"
-          echo "scan_tmpdir=$TMPDIR" >> "$GITHUB_OUTPUT"
-          echo "scan_log=$LOG" >> "$GITHUB_OUTPUT"
-          echo "✅ Scanner extraction complete"
-
-      # === Score proxies using real ping + adaptive region bonus ===
-      - name: Score proxies with Real Ping + Adaptive bonus
-        id: score
-        run: |
-          set -euo pipefail
-
-          # Retrieve references produced by the 'scan' step
-          TMPDIR="${{ steps.scan.outputs.scan_tmpdir:-}}"
-          PROXIES_FILE="${{ steps.scan.outputs.proxies_file:-}}"
-
-          # Validate inputs
-          if [ -z "$TMPDIR" ] || [ -z "$PROXIES_FILE" ] || [ ! -f "$PROXIES_FILE" ]; then
-            echo "❌ Missing proxies file - exiting"
-            echo "bestip=" >> "$GITHUB_OUTPUT"
-            echo "location=" >> "$GITHUB_OUTPUT"
-            echo "latency=" >> "$GITHUB_OUTPUT"
-            echo "realping=" >> "$GITHUB_OUTPUT"
-            echo "score=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Get adaptive prioritized locations from the learn step; fallback to PRIORITY_LOCATIONS
-          LOCS="${{ steps.learn.outputs.adaptive_locs:-${{ env.PRIORITY_LOCATIONS }}}"
-          if [ -z "$LOCS" ]; then
-            LOCS="${{ env.PRIORITY_LOCATIONS }}"
-          fi
-          IFS=',' read -ra ADAPTIVE_ARR <<< "$LOCS"
 
           SCORE_FILE="$TMPDIR/scores.txt"
           : > "$SCORE_FILE"
 
-          # Helper function: check whether a GEO code is in the adaptive list
-          in_adaptive() {
-            local g="$1"
-            for x in "${ADAPTIVE_ARR[@]}"; do
-              [ "$x" = "$g" ] && return 0
-            done
-            return 1
-          }
-
-          echo "=> Scoring proxies (real ping tests=${{ env.REAL_PING_TESTS }})"
-          while read -r latency ip; do
-            # Ensure latency is numeric; if not present, set a large default
-            latency_num=$(echo "$latency" | tr -cd '0-9')
-            [ -z "$latency_num" ] && latency_num=9999
-
-            # Geo detection (country code) via geoiplookup; fallback to XX
-            GEO_RAW=$(geoiplookup "$ip" 2>/dev/null || true)
-            GEO=$(echo "$GEO_RAW" | awk -F': ' '{print $2}' | cut -d',' -f1 | tr -d ' ' || echo "XX")
+          echo "=> Performing GeoIP + real ping tests and computing scores..."
+          while read -r lat ip; do
+            # get country code/name from geoiplookup
+            GEO_RAW=$(geoiplookup "$ip" 2>/dev/null || echo "")
+            GEO=$(echo "$GEO_RAW" | awk -F': ' '{print $2}' | cut -d',' -f1 | tr -d ' ')
             [ -z "$GEO" ] && GEO="XX"
 
-            # Real ping measurement (best-effort). If ping fails, use a high default.
+            LAT=${lat//[^0-9]/}
+            [ -z "$LAT" ] && LAT=9999
+
             REAL_PING=9999
-            set +e
-            if ping -c "${{ env.REAL_PING_TESTS }}" -W 1 "$ip" > /tmp/pinglog 2>/dev/null; then
-              # Extract average RTT from common ping output variants
-              if awk '/rtt|round-trip/ {print $0; exit}' /tmp/pinglog >/dev/null 2>&1; then
-                AVG=$(awk -F'/' '/rtt|round-trip/ {print $5; exit}' /tmp/pinglog 2>/dev/null || true)
+            # ping with short timeout (1s) and small count; fallback safe handling
+            if ping -c ${REAL_PING_TESTS} -W 1 "$ip" >/tmp/pinglog 2>/dev/null; then
+              # extract average ms (linux format rtt min/avg/max/mdev = ...)
+              # if not found, fallback to 9999
+              AVG=$(awk -F'/' '/rtt/ {print $5} END{if(NR==0) print ""}' /tmp/pinglog || true)
+              if [ -n "$AVG" ]; then
+                # round to integer
                 REAL_PING=$(printf "%.0f" "$AVG" 2>/dev/null || echo 9999)
               fi
             fi
-            set -e
 
-            # Adaptive GEO bonus: award a fixed bonus if the GEO matches adaptive priority
+            # GEO bonus: if GEO is in priority list => add significant bonus
             GEO_BONUS=0
-            if in_adaptive "$GEO"; then
+            # create pattern to match any of LOCS tokens
+            if echo ",${LOCS}," | grep -E ",${GEO}," >/dev/null 2>&1; then
               GEO_BONUS=200
             fi
 
-            # Score formula (higher is better):
-            # score = (1000 / (lat+1)) + (1000 / (realping+1)) + GEO_BONUS
-            SCORE=$(awk -v L="$latency_num" -v R="$REAL_PING" -v B="$GEO_BONUS" 'BEGIN { printf "%.6f", ((1000 / (L+1)) + (1000 / (R+1)) + B) }')
-            echo "$SCORE $latency_num $REAL_PING $GEO $ip" >> "$SCORE_FILE"
-          done < "$PROXIES_FILE"
+            # Compute a heuristic score:
+            # higher is better; combines scanner latency (LAT), real ping, and geo bonus.
+            # Use safe AWK floating math
+            SCORE=$(awk "BEGIN { lat=${LAT}; rp=${REAL_PING}; bonus=${GEO_BONUS}; score = (1000/(lat+1)) + (1000/(rp+1)) + bonus; printf \"%.6f\", score }")
+            echo "$SCORE $LAT $REAL_PING $GEO $ip" >> "$SCORE_FILE"
+          done < "$TMPDIR/proxies.txt"
 
-          TOTAL_SCORES=$(wc -l < "$SCORE_FILE" 2>/dev/null || echo 0)
-          if [ "$TOTAL_SCORES" -eq 0 ]; then
-            echo "⚠️ No scored proxies"
+          # Choose the highest score
+          sort -nrk1,1 "$SCORE_FILE" > "$TMPDIR/sorted.txt"
+          BEST_LINE=$(head -n 1 "$TMPDIR/sorted.txt" || true)
+
+          if [ -z "$BEST_LINE" ]; then
             echo "bestip=" >> "$GITHUB_OUTPUT"
             echo "location=" >> "$GITHUB_OUTPUT"
             echo "latency=" >> "$GITHUB_OUTPUT"
             echo "realping=" >> "$GITHUB_OUTPUT"
             echo "score=" >> "$GITHUB_OUTPUT"
+            echo "total_proxies=$TOTAL" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Pick the highest-scoring proxy
-          sort -nrk1,1 "$SCORE_FILE" > "$TMPDIR/sorted.txt"
-          BEST_LINE=$(head -n 1 "$TMPDIR/sorted.txt" || true)
           BEST_SCORE=$(echo "$BEST_LINE" | awk '{print $1}')
           BEST_LATENCY=$(echo "$BEST_LINE" | awk '{print $2}')
           BEST_REALPING=$(echo "$BEST_LINE" | awk '{print $3}')
           BEST_LOC=$(echo "$BEST_LINE" | awk '{print $4}')
           BEST_IP=$(echo "$BEST_LINE" | awk '{print $5}')
 
-          # Sanity-check the selected IP
-          if ! echo "$BEST_IP" | grep -Eo '^([0-9]{1,3}\.){3}[0-9]{1,3}$' >/dev/null 2>&1; then
-            echo "❌ Selected IP invalid: $BEST_IP"
-            echo "bestip=" >> "$GITHUB_OUTPUT"
-            echo "location=" >> "$GITHUB_OUTPUT"
-            echo "latency=" >> "$GITHUB_OUTPUT"
-            echo "realping=" >> "$GITHUB_OUTPUT"
-            echo "score=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          echo "✅ Selected best: $BEST_IP ($BEST_LOC) [lat=${BEST_LATENCY}ms, realping=${BEST_REALPING}ms, score=${BEST_SCORE}]"
+          echo "bestip=${BEST_IP}" >> "$GITHUB_OUTPUT"
+          echo "location=${BEST_LOC}" >> "$GITHUB_OUTPUT"
+          echo "latency=${BEST_LATENCY}" >> "$GITHUB_OUTPUT"
+          echo "realping=${BEST_REALPING}" >> "$GITHUB_OUTPUT"
+          echo "score=${BEST_SCORE}" >> "$GITHUB_OUTPUT"
+          echo "total_proxies=$TOTAL" >> "$GITHUB_OUTPUT"
 
-          # Persist the selected IP to local cache for potential reuse
-          echo -n "$BEST_IP" > "${{ env.CACHE_FILE }}" || true
-
-          # Emit outputs for downstream steps
-          echo "bestip=$BEST_IP" >> "$GITHUB_OUTPUT"
-          echo "location=$BEST_LOC" >> "$GITHUB_OUTPUT"
-          echo "latency=$BEST_LATENCY" >> "$GITHUB_OUTPUT"
-          echo "realping=$BEST_REALPING" >> "$GITHUB_OUTPUT"
-          echo "score=$BEST_SCORE" >> "$GITHUB_OUTPUT"
-
-          echo "✅ Best selected: $BEST_IP ($BEST_LOC) [lat=$BEST_LATENCY ms, ping=$BEST_REALPING ms, score=$BEST_SCORE]"
-
-      # === Learn adaptive regions from Cloudflare D1 ===
-      - name: Learn adaptive regions from D1 (robust, non-fatal)
-        id: learn
-        env:
-          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-          CF_DATABASE_ID: ${{ secrets.CF_DATABASE_ID }}
-        run: |
-          set -euo pipefail
-
-          # If D1 credentials are missing, fall back to the default PRIORITY_LOCATIONS
-          if [ -z "${CF_API_TOKEN:-}" ] || [ -z "${CF_ACCOUNT_ID:-}" ] || [ -z "${CF_DATABASE_ID:-}" ]; then
-            echo "⚠️ Cloudflare D1 credentials missing — using default PRIORITY_LOCATIONS"
-            echo "adaptive_locs=${{ env.PRIORITY_LOCATIONS }}" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          API="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/d1/database/${CF_DATABASE_ID}/query"
-          AUTH="Authorization: Bearer ${CF_API_TOKEN}"
-          SQL='{"sql":"SELECT location, AVG(score) AS avg_score FROM proxy_history GROUP BY location;"}'
-
-          # Retry logic when calling D1
-          attempt=0
-          max_attempts=${MAX_D1_RETRIES}
-          sleep_base=${D1_RETRY_BASE_SLEEP}
-          RESULT=""
-          while [ $attempt -lt $max_attempts ]; do
-            attempt=$((attempt+1))
-            RESULT=$(curl -s -X POST -H "${AUTH}" -H "Content-Type: application/json" --data "$SQL" "$API" || true)
-            # Quick sanity check if response seems valid
-            if echo "$RESULT" | jq -e '.result[0].results' >/dev/null 2>&1; then
-              break
-            fi
-            if [ $attempt -lt $max_attempts ]; then
-              sleep $((sleep_base * attempt))
-            fi
-          done
-
-          TOP=""
-          if echo "$RESULT" | jq -e '.result[0].results' >/dev/null 2>&1; then
-            # Build a comma-separated list of top 5 locations by avg_score (highest first)
-            TOP=$(echo "$RESULT" | jq -r '.result[0].results[]? | "\(.location):\(.avg_score)"' 2>/dev/null | sort -t':' -k2 -nr | head -n5 | cut -d':' -f1 | tr '\n' ',' | sed 's/,$//')
-          fi
-
-          # Fallback to PRIORITY_LOCATIONS if no top list could be built
-          if [ -z "$TOP" ]; then
-            TOP="${{ env.PRIORITY_LOCATIONS }}"
-          fi
-
-          echo "adaptive_locs=$TOP" >> "$GITHUB_OUTPUT"
-          echo "✅ Adaptive learning prioritized: $TOP"
-
-      # === Update Cloudflare D1 with the chosen IP ===
-      - name: Update Cloudflare D1 (SmartPing AI) with chosen IP
-        if: always()
-        env:
-          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-          CF_DATABASE_ID: ${{ secrets.CF_DATABASE_ID }}
-          IP: ${{ steps.score.outputs.bestip }}
-          LOC: ${{ steps.score.outputs.location }}
-          LAT: ${{ steps.score.outputs.latency }}
-          RP: ${{ steps.score.outputs.realping }}
-          SCORE: ${{ steps.score.outputs.score }}
-        run: |
-          set -euo pipefail
-
-          # Skip D1 update if credentials are not present
-          if [ -z "${CF_API_TOKEN:-}" ] || [ -z "${CF_ACCOUNT_ID:-}" ] || [ -z "${CF_DATABASE_ID:-}" ]; then
-            echo "⚠️ Cloudflare D1 credentials missing — skipping D1 update"
-            exit 0
-          fi
-
-          API="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/d1/database/${CF_DATABASE_ID}/query"
-          AUTH="Authorization: Bearer ${CF_API_TOKEN}"
-          TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-          # Local copies with safe defaults
-          IPVAL="${IP:-}"
-          LOCVAL="${LOC:-}"
-          LATVAL="${LAT:-0}"
-          RPVAL="${RP:-0}"
-          SCOREVAL="${SCORE:-0}"
-
-          if [ -z "$IPVAL" ]; then
-            echo "⚠️ No IP to update (empty). Skipping DB update."
-            exit 0
-          fi
-
-          # Escape single quotes for SQL literals
-          esc() { printf "%s" "$1" | sed "s/'/''/g"; }
-          IP_ESC=$(esc "$IPVAL")
-          LOC_ESC=$(esc "$LOCVAL")
-
-          # Compose a transaction: update the single active row and append to history
-          SQL_BODY=$(jq -n --arg s1 "INSERT OR REPLACE INTO proxy_updates (id, ip, location, latency, real_ping, score, updated_at) VALUES (1, '$IP_ESC', '$LOC_ESC', ${LATVAL}, ${RPVAL}, ${SCOREVAL}, '$TS');" \
-                        --arg s2 "INSERT INTO proxy_history (ip, location, latency, real_ping, score, updated_at) VALUES ('$IP_ESC', '$LOC_ESC', ${LATVAL}, ${RPVAL}, ${SCOREVAL}, '$TS');" \
-                        '{sql: ("BEGIN; " + $s1 + " " + $s2 + " COMMIT;") }' )
-
-          # Execute D1 update and check HTTP status
-          STATUS=$(curl -s -o /tmp/d1_resp -w "%{http_code}" -X POST -H "${AUTH}" -H "Content-Type: application/json" --data "$SQL_BODY" "$API" || echo "000")
-          if [ "$STATUS" = "200" ] || [ "$STATUS" = "201" ]; then
-            echo "✅ SmartPing D1 update complete."
-          else
-            echo "❌ D1 update failed (HTTP $STATUS)"
-            cat /tmp/d1_resp || true
-            exit 1
-          fi
-
-      # === Upload logs for debugging / auditing ===
-      - name: Upload logs and artifacts
+      - name: Upload build & scan logs (for debugging)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: smartping-logs-${{ github.run_id }}
           path: |
-            ${{ env.SCAN_LOG }}
             build-output.log
-            /tmp/pinglog || true
+            ${{ env.SCAN_LOG }}
           retention-days: 7
-          if-no-files-found: warn
+          if-no-files-found: ignore
 
-  # === Cleanup: delete old workflow runs to avoid retention costs ===
+      - name: Update Cloudflare D1 (SmartPing AI)  # ONLY D1 update, no KV touches
+        if: steps.scan.outputs.bestip != ''
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_DATABASE_ID: ${{ secrets.CF_DATABASE_ID }}
+          IP: ${{ steps.scan.outputs.bestip }}
+          LOC: ${{ steps.scan.outputs.location }}
+          LAT: ${{ steps.scan.outputs.latency }}
+          RP: ${{ steps.scan.outputs.realping }}
+          SCORE: ${{ steps.scan.outputs.score }}
+          MAX_D1_RETRIES: ${{ env.MAX_D1_RETRIES }}
+          D1_RETRY_SLEEP: ${{ env.D1_RETRY_SLEEP }}
+        run: |
+          set -euo pipefail
+          # Validate required secrets/inputs
+          for v in CF_API_TOKEN CF_ACCOUNT_ID CF_DATABASE_ID IP; do
+            if [ -z "${!v:-}" ]; then
+              echo "❌ Required env/secret $v is missing"
+              exit 1
+            fi
+          done
+
+          API="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/d1/database/${CF_DATABASE_ID}/query"
+          AUTH_HDR="Authorization: Bearer ${CF_API_TOKEN}"
+          TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          # Get current active ip (id=1 assumed) to avoid unnecessary writes
+          echo "=> Fetching current active D1 record..."
+          CUR=$(curl -s -X POST -H "${AUTH_HDR}" -H "Content-Type: application/json" \
+            --data '{"sql":"SELECT ip FROM proxy_updates WHERE id=1;"}' "$API" \
+            | jq -r '.result[0].results[0].ip // empty' || echo "")
+
+          if [ "$CUR" = "$IP" ]; then
+            echo "✅ IP unchanged in D1 ($IP) — skipping update."
+            exit 0
+          fi
+
+          # Escape single quotes for SQL literal safety
+          esc() { printf "%s" "$1" | sed "s/'/''/g"; }
+          IP_ESC=$(esc "$IP")
+          LOC_ESC=$(esc "${LOC:-UNKNOWN}")
+          LAT_N=${LAT:-0}
+          RP_N=${RP:-0}
+          SCORE_N=${SCORE:-0}
+
+          SQL1="INSERT OR REPLACE INTO proxy_updates (id, ip, location, latency, real_ping, score, updated_at) VALUES (1, '${IP_ESC}', '${LOC_ESC}', ${LAT_N}, ${RP_N}, ${SCORE_N}, '${TS}');"
+          SQL2="INSERT INTO proxy_history (ip, location, latency, real_ping, score, updated_at) VALUES ('${IP_ESC}', '${LOC_ESC}', ${LAT_N}, ${RP_N}, ${SCORE_N}, '${TS}');"
+          BODY=$(jq -nc --arg sql "BEGIN; ${SQL1} ${SQL2} COMMIT;" '{"sql":$sql}')
+
+          # Retry loop for D1 write
+          attempt=0
+          max_attempts=${MAX_D1_RETRIES}
+          while [ $attempt -lt $max_attempts ]; do
+            attempt=$((attempt+1))
+            echo "=> D1 update attempt $attempt/$max_attempts..."
+            STATUS=$(curl -s -o /tmp/d1_resp -w "%{http_code}" -X POST -H "${AUTH_HDR}" -H "Content-Type: application/json" --data "$BODY" "$API" || echo "000")
+            if [ "$STATUS" = "200" ] || [ "$STATUS" = "201" ]; then
+              echo "✅ D1 update successful (HTTP $STATUS)"
+              cat /tmp/d1_resp || true
+              break
+            else
+              echo "⚠️ D1 update returned HTTP $STATUS"
+              [ -s /tmp/d1_resp ] && echo "=> Response:" && cat /tmp/d1_resp
+              if [ $attempt -lt $max_attempts ]; then
+                sleep_seconds=$(( D1_RETRY_SLEEP * attempt ))
+                echo "=> Retrying in ${sleep_seconds}s..."
+                sleep $sleep_seconds
+              else
+                echo "❌ All D1 update attempts failed"
+                exit 1
+              fi
+            fi
+          done
+
+          echo "=============================================="
+          echo "✅ SmartPing D1 Update Done"
+          echo "New IP: ${IP}"
+          echo "Region: ${LOC_ESC}"
+          echo "Latency: ${LAT_N} ms"
+          echo "RealPing: ${RP_N} ms"
+          echo "Score: ${SCORE_N}"
+          echo "Updated: ${TS}"
+          echo "=============================================="
+
   cleanup-runs:
     name: Delete old workflow runs
     runs-on: ubuntu-latest
