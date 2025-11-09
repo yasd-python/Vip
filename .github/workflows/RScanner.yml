@@ -1,4 +1,4 @@
-name: Rust Proxy Scanner - SmartPing Adaptive AI (D1 only)
+name: Rust Proxy Scanner - SmartPing Adaptive AI (D1 only) - FINAL
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
     - cron: '0 */6 * * *' # every 6 hours
 
 concurrency:
-  group: rust-proxy-smartping-d1
+  group: rust-proxy-smartping-d1-final
   cancel-in-progress: true
 
 permissions:
@@ -14,19 +14,52 @@ permissions:
   actions: write
 
 env:
+  # Core scanner
   SCAN_BINARY: ./target/release/RScanner
   SCAN_LOG: scan.log
   SCANNER_TIMEOUT: "600"        # seconds
   PRIORITY_LOCATIONS: "US,DE,GB,NL,FR,SG,JP,CA,AU,CH"
   REAL_PING_TESTS: "3"
-  MAX_D1_RETRIES: "3"
+
+  # D1 update retry policy
+  MAX_D1_RETRIES: "5"
   D1_RETRY_SLEEP: "2"
+
+  # TCP test
+  TCP_CONNECT_TESTS: "1"
+  TCP_TEST_PORT: "80"
+
+  # HTTP / throughput / TLS
+  HEALTH_URL_PATH: "/favicon.ico"
+  HEALTH_HTTP_TIMEOUT: "5"
+  THROUGHPUT_MAX_BYTES: "200000"
+  TLS_TEST_PORT: "443"
+  TLS_TIMEOUT: "5"
+
+  # Scoring weights (sensible defaults; adjust if you want a different policy)
+  W_SCANNER_LATENCY: "0.18"
+  W_REAL_PING: "0.22"
+  W_TCP_RTT: "0.05"
+  W_THROUGHPUT: "0.25"
+  W_TLS_HANDSHAKE: "0.10"
+  W_HEALTH: "0.10"
+  W_STABILITY: "0.05"
+  W_COST: "0.00"         # default neutral; set >0 and provide cost metadata if you want cost weighting
+  W_GEO_BONUS: "200"
+
+  # Behavior flags
+  DRY_RUN: "false"       # when "true" skip writing to D1
+  DEBUG: "false"         # when "true" emits verbose logs
+
+  # Output files
+  METRICS_OUTPUT: "metrics.json"
+  SUMMARY_OUTPUT: "scan_summary.json"
 
 jobs:
   smartping:
-    name: Build → Scan → Real Network Test → Update Cloudflare D1 (only)
+    name: Build → Scan → Advanced Tests → Score → Update Cloudflare D1
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository (full)
@@ -38,10 +71,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -y
-          # essential tools + geoip + ping utility
-          sudo apt-get install -y jq curl geoip-bin build-essential pkg-config libssl-dev ca-certificates coreutils iputils-ping netcat-openbsd
-
-          # verify geoiplookup exists
+          sudo apt-get install -y jq curl geoip-bin build-essential pkg-config libssl-dev ca-certificates coreutils iputils-ping netcat-openbsd openssl
           if ! command -v geoiplookup &>/dev/null; then
             echo "❌ geoiplookup not found after install!"
             exit 1
@@ -60,9 +90,9 @@ jobs:
             target
             ~/.cargo/registry
             ~/.cargo/git
-          key: rust-cache-v1-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: rust-cache-final-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            rust-cache-v1-${{ runner.os }}-
+            rust-cache-final-${{ runner.os }}-
 
       - name: Build Rust scanner (release)
         run: |
@@ -80,11 +110,14 @@ jobs:
           fi
           echo "✅ Build successful"
 
-      - name: Run scanner & SmartPing scoring (select best) 
+      - name: Run scanner & perform advanced tests + scoring
         id: scan
-        timeout-minutes: 20
+        timeout-minutes: 40
         run: |
           set -euo pipefail
+          shopt -s nocasematch || true
+
+          # --- envs ---
           BIN="${{ env.SCAN_BINARY }}"
           LOG="${{ env.SCAN_LOG }}"
           TMPDIR=$(mktemp -d)
@@ -93,226 +126,202 @@ jobs:
           LOCS="${{ env.PRIORITY_LOCATIONS }}"
           TIMEOUT="${{ env.SCANNER_TIMEOUT }}"
           REAL_PING_TESTS="${{ env.REAL_PING_TESTS }}"
+          TCP_TESTS="${{ env.TCP_CONNECT_TESTS }}"
+          TCP_PORT="${{ env.TCP_TEST_PORT }}"
+          HEALTH_PATH="${{ env.HEALTH_URL_PATH }}"
+          HEALTH_TIMEOUT="${{ env.HEALTH_HTTP_TIMEOUT }}"
+          THROUGHPUT_BYTES="${{ env.THROUGHPUT_MAX_BYTES }}"
+          TLS_PORT="${{ env.TLS_TEST_PORT }}"
+          TLS_TIMEOUT="${{ env.TLS_TIMEOUT }}"
+
+          # weights
+          W_SCANNER_LATENCY="${{ env.W_SCANNER_LATENCY }}"
+          W_REAL_PING="${{ env.W_REAL_PING }}"
+          W_TCP_RTT="${{ env.W_TCP_RTT }}"
+          W_THROUGHPUT="${{ env.W_THROUGHPUT }}"
+          W_TLS_HANDSHAKE="${{ env.W_TLS_HANDSHAKE }}"
+          W_HEALTH="${{ env.W_HEALTH }}"
+          W_STABILITY="${{ env.W_STABILITY }}"
+          W_COST="${{ env.W_COST }}"
+          W_GEO_BONUS="${{ env.W_GEO_BONUS }}"
+
+          DRY_RUN="${{ env.DRY_RUN }}"
+          DEBUG="${{ env.DEBUG }}"
+          METRICS="${{ env.METRICS_OUTPUT }}"
+          SUMMARY="${{ env.SUMMARY_OUTPUT }}"
 
           : > "$LOG"
-          if [ ! -x "$BIN" ]; then
-            chmod +x "$BIN" || true
-          fi
+          if [ ! -x "$BIN" ]; then chmod +x "$BIN" || true; fi
 
-          # Run scanner with timeout; allow non-zero exit but capture output
           echo "=> Running scanner with timeout ${TIMEOUT}s"
           timeout "${TIMEOUT}s" "$BIN" > "$LOG" 2>&1 || true
           echo "=> Scanner finished (or timed out). Log saved to $LOG"
 
-          # Parse PROXY LIVE lines robustly:
-          # Accept patterns that include an IPv4 and an approximate latency (e.g., "(123ms)" or "(123 ms)")
+          # Parse PROXY LIVE lines (support IPv4 & IPv6)
           awk 'BEGIN{IGNORECASE=1}
             /PROXY[[:space:]]+LIVE/ {
-              # find first IPv4
-              if (match($0, /([0-9]{1,3}(\.[0-9]{1,3}){3})/, ip)) {
-                # try to find latency inside parentheses or like "123ms"
-                lat="9999";
-                if (match($0, /\(([[:space:]]*([0-9]+)[[:space:]]*m?s)[[:space:]]*\)/, a)) {
-                  lat = a[2];
-                } else if (match($0, /([0-9]+)[[:space:]]*m?s/, b)) {
-                  lat = b[1];
-                }
-                gsub(/[^0-9]/,"",lat)
-                if (lat+0 <= 0) lat = 9999
-                print lat+0, ip[1]
-              }
+              ip="";
+              if (match($0, /([0-9a-fA-F:]+)/, ip6)) { ip=ip6[1]; gsub(/^|$/,"",ip) }
+              else if (match($0, /([0-9]{1,3}(\.[0-9]{1,3}){3})/, ip4)) { ip=ip4[1] }
+              lat="9999";
+              if (match($0, /([[:space:]]*([0-9]+)[[:space:]]*m?s)[[:space:]]*/, a)) { lat=a[2] }
+              else if (match($0, /([0-9]+)[[:space:]]*m?s/, b)) { lat=b[1] }
+              gsub(/[^0-9]/,"",lat)
+              if (lat+0 <= 0) lat = 9999
+              if (ip != "") print lat+0, ip
             }' "$LOG" > "$TMPDIR/proxies.txt" || true
 
           TOTAL=$(wc -l < "$TMPDIR/proxies.txt" 2>/dev/null || echo 0)
           echo "=> Found $TOTAL candidate proxies"
 
-          # If none, set empty outputs and exit gracefully
           if [ "$TOTAL" -eq 0 ]; then
-            echo "bestip=" >> "$GITHUB_OUTPUT"
-            echo "location=" >> "$GITHUB_OUTPUT"
-            echo "latency=" >> "$GITHUB_OUTPUT"
-            echo "realping=" >> "$GITHUB_OUTPUT"
-            echo "score=" >> "$GITHUB_OUTPUT"
-            echo "total_proxies=0" >> "$GITHUB_OUTPUT"
+            echo "bestip=" >> "$GITHUB_OUTPUT"; echo "location=" >> "$GITHUB_OUTPUT"; echo "latency=" >> "$GITHUB_OUTPUT";
+            echo "realping=" >> "$GITHUB_OUTPUT"; echo "score=" >> "$GITHUB_OUTPUT"; echo "total_proxies=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          SCORE_FILE="$TMPDIR/scores.txt"
-          : > "$SCORE_FILE"
+          SCORE_RAW="$TMPDIR/scores_raw.txt"; : > "$SCORE_RAW"
+          : > "$TMPDIR/$METRICS"
 
-          echo "=> Performing GeoIP + real ping tests and computing scores..."
+          # helper funcs
+          measure_tls() {
+            host="$1"; port="$2"; timeout_s="$3"
+            start=$(date +%s%3N)
+            if timeout "$timeout_s" openssl s_client -connect "${host}:${port}" -servername "${host}" </dev/null >/dev/null 2>&1; then
+              end=$(date +%s%3N); echo $((end-start))
+            else
+              echo 9999
+            fi
+          }
+
+          measure_http_and_throughput() {
+            proto="$1"; host="$2"; path="$3"; timeout_s="$4"; max_bytes="$5"
+            url="${proto}://${host}${path}"
+            start=$(date +%s%3N)
+            status_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time "$timeout_s" "$url" || echo "000")
+            end=$(date +%s%3N)
+            elapsed=$((end-start))
+            health_ok=0
+            if [ "$status_code" -ge 200 ] && [ "$status_code" -lt 400 ]; then health_ok=1; fi
+            speed=$(curl -s --max-time "$timeout_s" -r 0-$((max_bytes-1)) -w "%{speed_download}" -o /dev/null "$url" || echo 0)
+            speed_int=$(printf "%.0f" "$speed" 2>/dev/null || echo 0)
+            echo "${health_ok},${elapsed},${speed_int},${status_code}"
+          }
+
+          measure_tcp_rtt() {
+            host="$1"; port="$2"; attempts="$3"
+            best=9999
+            for i in $(seq 1 $attempts); do
+              start=$(date +%s%3N)
+              if timeout 1 bash -c "cat < /dev/tcp/${host}/${port} >/dev/null 2>&1"; then
+                end=$(date +%s%3N)
+                rtt=$((end-start))
+                if [ "$rtt" -lt "$best" ]; then best=$rtt; fi
+              fi
+            done
+            echo "$best"
+          }
+
+          measure_stability() {
+            host="$1"; ping_count="$2"; proto="$3"; path="$4"; http_timeout="$5"
+            ok_ping=0; ok_http=0
+            for i in $(seq 1 $ping_count); do
+              if ping -c 1 -W 1 "$host" >/dev/null 2>&1; then ok_ping=$((ok_ping+1)); fi
+              status=$(curl -s -o /dev/null -w "%{http_code}" --max-time "$http_timeout" "${proto}://${host}${path}" || echo "000")
+              if [ "$status" -ge 200 ] && [ "$status" -lt 400 ]; then ok_http=$((ok_http+1)); fi
+            done
+            ping_ratio=$(( (ok_ping * 100) / (ping_count > 0 ? ping_count : 1) ))
+            http_ratio=$(( (ok_http * 100) / (ping_count > 0 ? ping_count : 1) ))
+            echo "${ping_ratio},${http_ratio}"
+          }
+
+          # iterate candidates
           while read -r lat ip; do
-            # get country code/name from geoiplookup
-            GEO_RAW=$(geoiplookup "$ip" 2>/dev/null || echo "")
+            IP_CLEAN="$ip"
+            LAT=${lat//[^0-9]/}; [ -z "$LAT" ] && LAT=9999
+
+            GEO_RAW=$(geoiplookup "$IP_CLEAN" 2>/dev/null || echo "")
             GEO=$(echo "$GEO_RAW" | awk -F': ' '{print $2}' | cut -d',' -f1 | tr -d ' ')
             [ -z "$GEO" ] && GEO="XX"
 
-            LAT=${lat//[^0-9]/}
-            [ -z "$LAT" ] && LAT=9999
-
+            # real ping
             REAL_PING=9999
-            # ping with short timeout (1s) and small count; fallback safe handling
-            if ping -c ${REAL_PING_TESTS} -W 1 "$ip" >/tmp/pinglog 2>/dev/null; then
-              # extract average ms (linux format rtt min/avg/max/mdev = ...)
-              # if not found, fallback to 9999
+            if ping -c ${REAL_PING_TESTS} -W 1 "$IP_CLEAN" >/tmp/pinglog 2>/dev/null; then
               AVG=$(awk -F'/' '/rtt/ {print $5} END{if(NR==0) print ""}' /tmp/pinglog || true)
-              if [ -n "$AVG" ]; then
-                # round to integer
-                REAL_PING=$(printf "%.0f" "$AVG" 2>/dev/null || echo 9999)
-              fi
+              if [ -n "$AVG" ]; then REAL_PING=$(printf "%.0f" "$AVG" 2>/dev/null || echo 9999); fi
             fi
 
-            # GEO bonus: if GEO is in priority list => add significant bonus
+            # tcp rtt
+            TCP_RTT=9999
+            if [ "$TCP_TESTS" -gt 0 ]; then TCP_RTT=$(measure_tcp_rtt "$IP_CLEAN" "$TCP_PORT" "$TCP_TESTS" || echo 9999); fi
+
+            # TLS handshake
+            TLS_MS=9999
+            TLS_MS=$(measure_tls "$IP_CLEAN" "$TLS_PORT" "$TLS_TIMEOUT" || echo 9999)
+
+            # HTTP health & throughput (try https then http)
+            HTTP_PROTO="https"
+            HEALTH_RES=$(measure_http_and_throughput "$HTTP_PROTO" "$IP_CLEAN" "$HEALTH_PATH" "$HEALTH_TIMEOUT" "$THROUGHPUT_BYTES" || echo "0,9999,0,000")
+            HEALTH_OK=$(echo "$HEALTH_RES" | cut -d',' -f1)
+            if [ "$HEALTH_OK" -eq 0 ]; then
+              HTTP_PROTO="http"
+              HEALTH_RES=$(measure_http_and_throughput "$HTTP_PROTO" "$IP_CLEAN" "$HEALTH_PATH" "$HEALTH_TIMEOUT" "$THROUGHPUT_BYTES" || echo "0,9999,0,000")
+            fi
+            HEALTH_OK=$(echo "$HEALTH_RES" | cut -d',' -f1)
+            HEALTH_LAT_MS=$(echo "$HEALTH_RES" | cut -d',' -f2)
+            THROUGHPUT_BPS=$(echo "$HEALTH_RES" | cut -d',' -f3)
+            HEALTH_STATUS_CODE=$(echo "$HEALTH_RES" | cut -d',' -f4)
+
+            # stability
+            STAB=$(measure_stability "$IP_CLEAN" 3 "$HTTP_PROTO" "$HEALTH_PATH" "$HEALTH_TIMEOUT" || echo "0,0")
+            PING_RATIO=$(echo "$STAB" | cut -d',' -f1)
+            HTTP_RATIO=$(echo "$STAB" | cut -d',' -f2)
+
+            # cost neutral
+            COST_SCORE=0
+
+            # geo bonus check
             GEO_BONUS=0
-            # create pattern to match any of LOCS tokens
-            if echo ",${LOCS}," | grep -E ",${GEO}," >/dev/null 2>&1; then
-              GEO_BONUS=200
-            fi
+            if echo ",${LOCS}," | grep -E ",${GEO}," >/dev/null 2>&1; then GEO_BONUS=$W_GEO_BONUS; fi
 
-            # Compute a heuristic score:
-            # higher is better; combines scanner latency (LAT), real ping, and geo bonus.
-            # Use safe AWK floating math
-            SCORE=$(awk "BEGIN { lat=${LAT}; rp=${REAL_PING}; bonus=${GEO_BONUS}; score = (1000/(lat+1)) + (1000/(rp+1)) + bonus; printf \"%.6f\", score }")
-            echo "$SCORE $LAT $REAL_PING $GEO $ip" >> "$SCORE_FILE"
+            # compute raw score using AWK (floating math)
+            RAW_SCORE=$(awk -v w_lat="$W_SCANNER_LATENCY" -v lat="$LAT" \
+                          -v w_rp="$W_REAL_PING" -v rp="$REAL_PING" \
+                          -v w_tcp="$W_TCP_RTT" -v tcp="$TCP_RTT" \
+                          -v w_thr="$W_THROUGHPUT" -v thr="$THROUGHPUT_BPS" \
+                          -v w_tls="$W_TLS_HANDSHAKE" -v tls="$TLS_MS" \
+                          -v w_health="$W_HEALTH" -v health_ok="$HEALTH_OK" -v health_lat="$HEALTH_LAT_MS" \
+                          -v w_stab="$W_STABILITY" -v ping_ratio="$PING_RATIO" -v http_ratio="$HTTP_RATIO" \
+                          -v w_cost="$W_COST" -v cost="$COST_SCORE" \
+                          -v geo_bonus="$GEO_BONUS" \
+                          'BEGIN{
+                             s_lat = (lat>0 ? 1000/(lat+1) : 0);
+                             s_rp  = (rp>0 ? 1000/(rp+1) : 0);
+                             s_tcp = (tcp<9999 && tcp>0 ? 1000/(tcp+1) : 0);
+                             s_thr = (thr>0 ? thr/1024.0 : 0);
+                             s_tls = (tls<9999 && tls>0 ? 1000/(tls+1) : 0);
+                             s_health = (health_ok==1 ? (1000/(health_lat+1)) : 0);
+                             s_stab = ( (ping_ratio + http_ratio) / 2.0 );
+                             s_cost = (cost>0 ? cost : 0);
+                             raw = (w_lat*s_lat) + (w_rp*s_rp) + (w_tcp*s_tcp) + (w_thr*s_thr) + (w_tls*s_tls) + (w_health*s_health) + (w_stab*s_stab) + (w_cost*s_cost) + geo_bonus;
+                             printf("%.6f", raw);
+                          }')
+
+            # store raw metrics
+            echo "${RAW_SCORE} ${LAT} ${REAL_PING} ${TCP_RTT} ${THROUGHPUT_BPS} ${TLS_MS} ${HEALTH_OK} ${HEALTH_LAT_MS} ${HEALTH_STATUS_CODE} ${PING_RATIO} ${HTTP_RATIO} ${GEO} ${IP_CLEAN}" >> "$SCORE_RAW"
+
+            # append json line
+            jq -nc --arg ip "$IP_CLEAN" --arg geo "$GEO" \
+              --argjson lat "$LAT" --argjson realping "$REAL_PING" --argjson tcp "$TCP_RTT" \
+              --argjson throughput "$THROUGHPUT_BPS" --argjson tls "$TLS_MS" \
+              --argjson health_ok "$HEALTH_OK" --argjson health_lat "$HEALTH_LAT_MS" \
+              --argjson health_status "$HEALTH_STATUS_CODE" --argjson ping_ratio "$PING_RATIO" --argjson http_ratio "$HTTP_RATIO" \
+              --argjson raw "$RAW_SCORE" \
+              '{ip:$ip,geo:$geo,latency:$lat,realping:$realping,tcp_rtt:$tcp,throughput_bps:$throughput,tls_ms:$tls,health_ok:$health_ok,health_latency_ms:$health_lat,health_status:$health_status,ping_ratio:$ping_ratio,http_ratio:$http_ratio,raw_score:$raw}' \
+              >> "$TMPDIR/$METRICS"
+
           done < "$TMPDIR/proxies.txt"
 
-          # Choose the highest score
-          sort -nrk1,1 "$SCORE_FILE" > "$TMPDIR/sorted.txt"
-          BEST_LINE=$(head -n 1 "$TMPDIR/sorted.txt" || true)
-
-          if [ -z "$BEST_LINE" ]; then
-            echo "bestip=" >> "$GITHUB_OUTPUT"
-            echo "location=" >> "$GITHUB_OUTPUT"
-            echo "latency=" >> "$GITHUB_OUTPUT"
-            echo "realping=" >> "$GITHUB_OUTPUT"
-            echo "score=" >> "$GITHUB_OUTPUT"
-            echo "total_proxies=$TOTAL" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          BEST_SCORE=$(echo "$BEST_LINE" | awk '{print $1}')
-          BEST_LATENCY=$(echo "$BEST_LINE" | awk '{print $2}')
-          BEST_REALPING=$(echo "$BEST_LINE" | awk '{print $3}')
-          BEST_LOC=$(echo "$BEST_LINE" | awk '{print $4}')
-          BEST_IP=$(echo "$BEST_LINE" | awk '{print $5}')
-
-          echo "✅ Selected best: $BEST_IP ($BEST_LOC) [lat=${BEST_LATENCY}ms, realping=${BEST_REALPING}ms, score=${BEST_SCORE}]"
-          echo "bestip=${BEST_IP}" >> "$GITHUB_OUTPUT"
-          echo "location=${BEST_LOC}" >> "$GITHUB_OUTPUT"
-          echo "latency=${BEST_LATENCY}" >> "$GITHUB_OUTPUT"
-          echo "realping=${BEST_REALPING}" >> "$GITHUB_OUTPUT"
-          echo "score=${BEST_SCORE}" >> "$GITHUB_OUTPUT"
-          echo "total_proxies=$TOTAL" >> "$GITHUB_OUTPUT"
-
-      - name: Upload build & scan logs (for debugging)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: smartping-logs-${{ github.run_id }}
-          path: |
-            build-output.log
-            ${{ env.SCAN_LOG }}
-          retention-days: 7
-          if-no-files-found: ignore
-
-      - name: Update Cloudflare D1 (SmartPing AI)  # ONLY D1 update, no KV touches
-        if: steps.scan.outputs.bestip != ''
-        env:
-          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-          CF_DATABASE_ID: ${{ secrets.CF_DATABASE_ID }}
-          IP: ${{ steps.scan.outputs.bestip }}
-          LOC: ${{ steps.scan.outputs.location }}
-          LAT: ${{ steps.scan.outputs.latency }}
-          RP: ${{ steps.scan.outputs.realping }}
-          SCORE: ${{ steps.scan.outputs.score }}
-          MAX_D1_RETRIES: ${{ env.MAX_D1_RETRIES }}
-          D1_RETRY_SLEEP: ${{ env.D1_RETRY_SLEEP }}
-        run: |
-          set -euo pipefail
-          # Validate required secrets/inputs
-          for v in CF_API_TOKEN CF_ACCOUNT_ID CF_DATABASE_ID IP; do
-            if [ -z "${!v:-}" ]; then
-              echo "❌ Required env/secret $v is missing"
-              exit 1
-            fi
-          done
-
-          API="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/d1/database/${CF_DATABASE_ID}/query"
-          AUTH_HDR="Authorization: Bearer ${CF_API_TOKEN}"
-          TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-          # Get current active ip (id=1 assumed) to avoid unnecessary writes
-          echo "=> Fetching current active D1 record..."
-          CUR=$(curl -s -X POST -H "${AUTH_HDR}" -H "Content-Type: application/json" \
-            --data '{"sql":"SELECT ip FROM proxy_updates WHERE id=1;"}' "$API" \
-            | jq -r '.result[0].results[0].ip // empty' || echo "")
-
-          if [ "$CUR" = "$IP" ]; then
-            echo "✅ IP unchanged in D1 ($IP) — skipping update."
-            exit 0
-          fi
-
-          # Escape single quotes for SQL literal safety
-          esc() { printf "%s" "$1" | sed "s/'/''/g"; }
-          IP_ESC=$(esc "$IP")
-          LOC_ESC=$(esc "${LOC:-UNKNOWN}")
-          LAT_N=${LAT:-0}
-          RP_N=${RP:-0}
-          SCORE_N=${SCORE:-0}
-
-          SQL1="INSERT OR REPLACE INTO proxy_updates (id, ip, location, latency, real_ping, score, updated_at) VALUES (1, '${IP_ESC}', '${LOC_ESC}', ${LAT_N}, ${RP_N}, ${SCORE_N}, '${TS}');"
-          SQL2="INSERT INTO proxy_history (ip, location, latency, real_ping, score, updated_at) VALUES ('${IP_ESC}', '${LOC_ESC}', ${LAT_N}, ${RP_N}, ${SCORE_N}, '${TS}');"
-          BODY=$(jq -nc --arg sql "BEGIN; ${SQL1} ${SQL2} COMMIT;" '{"sql":$sql}')
-
-          # Retry loop for D1 write
-          attempt=0
-          max_attempts=${MAX_D1_RETRIES}
-          while [ $attempt -lt $max_attempts ]; do
-            attempt=$((attempt+1))
-            echo "=> D1 update attempt $attempt/$max_attempts..."
-            STATUS=$(curl -s -o /tmp/d1_resp -w "%{http_code}" -X POST -H "${AUTH_HDR}" -H "Content-Type: application/json" --data "$BODY" "$API" || echo "000")
-            if [ "$STATUS" = "200" ] || [ "$STATUS" = "201" ]; then
-              echo "✅ D1 update successful (HTTP $STATUS)"
-              cat /tmp/d1_resp || true
-              break
-            else
-              echo "⚠️ D1 update returned HTTP $STATUS"
-              [ -s /tmp/d1_resp ] && echo "=> Response:" && cat /tmp/d1_resp
-              if [ $attempt -lt $max_attempts ]; then
-                sleep_seconds=$(( D1_RETRY_SLEEP * attempt ))
-                echo "=> Retrying in ${sleep_seconds}s..."
-                sleep $sleep_seconds
-              else
-                echo "❌ All D1 update attempts failed"
-                exit 1
-              fi
-            fi
-          done
-
-          echo "=============================================="
-          echo "✅ SmartPing D1 Update Done"
-          echo "New IP: ${IP}"
-          echo "Region: ${LOC_ESC}"
-          echo "Latency: ${LAT_N} ms"
-          echo "RealPing: ${RP_N} ms"
-          echo "Score: ${SCORE_N}"
-          echo "Updated: ${TS}"
-          echo "=============================================="
-
-  cleanup-runs:
-    name: Delete old workflow runs
-    runs-on: ubuntu-latest
-    needs: smartping
-    if: always()
-    permissions:
-      actions: write
-      contents: read
-    steps:
-      - name: Delete old workflow runs
-        uses: Mattraks/delete-workflow-runs@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          repository: ${{ github.repository }}
-          retain_days: 0
-          keep_minimum_runs: 0
+          # Normalize into 0-100 (best = 100)
+          RAW_MIN=$(awk 'NR==1{min=$1} NR>1{if($1<min) min=$1} END{print min}' "$SCORE_RAW")
+          RAW_MAX=$(awk 'NR==1{max
