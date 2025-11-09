@@ -27,16 +27,13 @@ env:
 
   # TCP test
   TCP_CONNECT_TESTS: "1"
-  # TCP_TEST_PORT: "80"  <--
-  # ^^^^ این متغیر دیگر استفاده نمی‌شود. پورت از لاگ اسکنر خوانده می‌شود.
+  # TCP_TEST_PORT و TLS_TEST_PORT دیگر استفاده نمی‌شوند چون پورت پویا است
 
   # HTTP / throughput / TLS
   HEALTH_URL_PATH: "/favicon.ico"
   HEALTH_HTTP_TIMEOUT: "5"
   THROUGHPUT_MAX_BYTES: "200000"
-  # TLS_TEST_PORT: "443" <--
   TLS_TIMEOUT: "5"
-  # ^^^^ این متغیر دیگر استفاده نمی‌شود. پورت از لاگ اسکنر خوانده می‌شود.
 
   # Scoring weights (sensible defaults; adjust if you want a different policy)
   W_SCANNER_LATENCY: "0.18"
@@ -129,11 +126,9 @@ jobs:
           TIMEOUT="${{ env.SCANNER_TIMEOUT }}"
           REAL_PING_TESTS="${{ env.REAL_PING_TESTS }}"
           TCP_TESTS="${{ env.TCP_CONNECT_TESTS }}"
-          # TCP_PORT - REMOVED
           HEALTH_PATH="${{ env.HEALTH_URL_PATH }}"
           HEALTH_TIMEOUT="${{ env.HEALTH_HTTP_TIMEOUT }}"
           THROUGHPUT_BYTES="${{ env.THROUGHPUT_MAX_BYTES }}"
-          # TLS_PORT - REMOVED
           TLS_TIMEOUT="${{ env.TLS_TIMEOUT }}"
 
           # weights
@@ -165,12 +160,12 @@ jobs:
           echo "=> Scanner finished (or timed out). Log saved to $LOG"
 
           # --- helper functions ---
+          # این توابع همگی اصلاح شده‌اند تا پورت پویا را بپذیرند
 
-          # retry_with_backoff used for raw tcp connect attempts (returns 0 on success)
           retry_with_backoff() {
             local host="$1"
             local port="$2"
-            local max_retries=2 # Reduced for performance
+            local max_retries=2
             local delay=1
             local retries=0
             while [ $retries -lt $max_retries ]; do
@@ -190,7 +185,6 @@ jobs:
             for i in $(seq 1 "$attempts"); do
               if retry_with_backoff "$host" "$port"; then
                 start=$(date +%s%3N)
-                # quickly open/close connection to measure minimal RTT
                 timeout 2 bash -c "exec 3<>/dev/tcp/${host}/${port}" >/dev/null 2>&1 || true
                 end=$(date +%s%3N)
                 rtt=$((end-start))
@@ -202,9 +196,7 @@ jobs:
 
           measure_tls() {
             host="$1"; port="$2"; tout="$3"
-            # measure TLS handshake time using openssl s_client with timeout
             start=$(date +%s%3N)
-            # We connect to the proxy's IP and discovered PORT
             if timeout "${tout}s" bash -c "echo | openssl s_client -connect ${host}:${port} -servername google.com >/dev/null 2>&1"; then
               end=$(date +%s%3N)
               echo $((end-start))
@@ -213,51 +205,39 @@ jobs:
             fi
           }
 
-          # LOGIC FIX: Added 'port' as an argument
           measure_http_and_throughput() {
             proto="$1"; host="$2"; port="$3"; path="$4"; tout="$5"; max_bytes="$6"
-            # Use curl to fetch small resource, measure status, time (s), bytes downloaded
             TMP_BODY="${TMPDIR}/http_body_$$"
             : > "$TMP_BODY"
-            # LOGIC FIX: Added 'port' to the curl URL
             out=$(timeout "${tout}s" curl --max-time "${tout}" --insecure -sS -w "%{http_code},%{time_total},%{size_download}" -o "$TMP_BODY" "${proto}://${host}:${port}${path}" 2>/dev/null) || out=""
             if [ -z "$out" ]; then
-              # failed
               printf "0,9999,0,000"
               return 0
             fi
             http_code=$(echo "$out" | cut -d',' -f1)
             time_total=$(echo "$out" | cut -d',' -f2)
             size_download=$(echo "$out" | cut -d',' -f3)
-            # convert time_total (seconds) to milliseconds
             ms=$(awk -v t="$time_total" 'BEGIN{printf("%d", t*1000)}')
-            # throughput in bps = bytes / seconds (avoid division by zero)
             if awk "BEGIN{exit !($time_total>0)}"; then
               bps=$(awk -v b="$size_download" -v t="$time_total" 'BEGIN{printf("%d", (b*8)/t)}')
             else
               bps=0
             fi
-            # ensure health_ok: 1 if http code 200-399
             health_ok=0
             if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 400 ]; then health_ok=1; fi
             printf "%d,%s,%d,%03d" "$health_ok" "$ms" "$bps" "$http_code"
             return 0
           }
 
-          # LOGIC FIX: Added 'port' as an argument
           measure_stability() {
             host="$1"; port="$2"; pings="$3"; proto="$4"; path="$5"; tout="$6"
-            # ping ratio (ping does not need a port)
             succ_ping=0
             for i in $(seq 1 "$pings"); do
               if timeout 2 ping -c 1 -W 1 "$host" >/dev/null 2>&1; then succ_ping=$((succ_ping+1)); fi
             done
             ping_ratio=$(awk -v s="$succ_ping" -v t="$pings" 'BEGIN{printf("%.2f", (t>0)?s/t:0)}')
-            # http ratio
             succ_http=0
             for i in $(seq 1 "$pings"); do
-              # small timeout for cached failures
-              # LOGIC FIX: Added 'port' to the curl URL
               if timeout "${tout}s" curl --max-time "${tout}" --insecure -sS -o /dev/null -w "%{http_code}" "${proto}://${host}:${port}${path}" 2>/dev/null | awk '{exit ($1>=200 && $1<400)?0:1}'; then
                 succ_http=$((succ_http+1))
               fi
@@ -267,42 +247,48 @@ jobs:
           }
 
           # --- create proxies list from the scanner log ---
-          # CRITICAL FIX 2.0: Parse IP AND Port from the log.
-          # We assume the log line contains "LIVE" and an "IP:PORT" string.
-          # Example: "PROXY LIVE 123ms 1.2.3.4:8080"
+          # CRITICAL FIX 3.0: پارسر جدید برای خواندن فرمت (IP PORT) با فاصله
           PROXIES_FILE="${TMPDIR}/proxies.txt"
           : > "$PROXIES_FILE"
           
-          echo "=> Parsing '$LOG' for live proxies (IP:PORT format)..."
+          echo "=> Parsing '$LOG' for live proxies (IP PORT space-separated format)..."
           
-          # Use grep -oP to find all IP:Port strings on lines containing "LIVE"
-          # This is more robust and finds IP:PORT patterns anywhere on a "LIVE" line
-          grep -i "LIVE" "$LOG" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}' | while read -r ip_port; do
-              # Now try to find the latency on the *same* line
-              lat_line=$(grep -i "LIVE" "$LOG" | grep "$ip_port" | head -n1)
-              lat=$(echo "$lat_line" | grep -Eo '[0-9]+' | head -n1) # Simple heuristic: first number
-              [ -z "$lat" ] && lat=9999
+          grep -i "LIVE" "$LOG" | while read -r line; do
+              # 1. پیدا کردن آدرس IP
+              ip=$(echo "$line" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1)
+              [ -z "$ip" ] && continue
+
+              # 2. پیدا کردن پورت (اولین عددی که بلافاصله بعد از IP می‌آید)
+              # از Perl-regex برای پیدا کردن IP و فاصله و سپس عدد پورت استفاده می‌کنیم
+              port=$(echo "$line" | grep -oP "${ip}[[:space:]]+\K([0-9]{1,5})" | head -n1)
+              [ -z "$port" ] && continue
               
-              echo "${lat} ${ip_port}" >> "$PROXIES_FILE"
+              # 3. پیدا کردن لَتنسی (عددی که قبل از "ms" آمده یا آخرین عدد خط)
+              lat=$(echo "$line" | grep -Eo '[0-9]+[[:space:]]*ms' | grep -Eo '[0-9]+' | head -n1)
+              [ -z "$lat" ] && lat=$(echo "$line" | grep -Eo '[0-9]+' | tail -n1) # اگر "ms" نبود، آخرین عدد
+              [ -z "$lat" ] && lat=9999 # دیفالت
+              
+              # 4. ذخیره در فرمت: "LATENCY IP PORT"
+              echo "${lat} ${ip} ${port}" >> "$PROXIES_FILE"
           done
           
-          # De-duplicate the list
+          # حذف موارد تکراری
           sort -u -o "$PROXIES_FILE" "$PROXIES_FILE"
 
-          # If PROXIES_FILE empty -> no proxies found; exit gracefully
+          # اگر پراکسی پیدا نشد، با موفقیت خارج شو
           if [ ! -s "$PROXIES_FILE" ]; then
-            echo "No LIVE proxies in IP:PORT format were found in $LOG — exiting successfully."
+            echo "No LIVE proxies in 'IP PORT' format were found in $LOG — exiting successfully."
             exit 0
           fi
           
           echo "=> Found $(wc -l < "$PROXIES_FILE") unique live proxies. Starting advanced tests..."
 
           # --- iterate proxies and run tests ---
-          # LOGIC FIX: Loop now reads 'ip_port'
-          while read -r lat ip_port; do
-            # LOGIC FIX: Split IP and Port
-            IP_CLEAN=$(echo "$ip_port" | cut -d':' -f1)
-            PORT_CLEAN=$(echo "$ip_port" | cut -d':' -f2)
+          # اصلاح حلقه: اکنون 3 متغیر (lat, ip, port) را می‌خواند
+          while read -r lat ip port; do
+            # تخصیص متغیرهای IP و Port
+            IP_CLEAN="${ip}"
+            PORT_CLEAN="${port}"
             
             LAT=${lat//[^0-9]/}; [ -z "$LAT" ] && LAT=9999
             
@@ -313,31 +299,27 @@ jobs:
             GEO=$(echo "$GEO_RAW" | awk -F': ' '{print $2}' | cut -d',' -f1 | tr -d ' ')
             [ -z "$GEO" ] && GEO="XX"
 
-            # real ping (ping does not need a port)
+            # real ping (پینگ به پورت نیاز ندارد)
             REAL_PING=9999
             if ping -c ${REAL_PING_TESTS} -W 1 "$IP_CLEAN" >/tmp/pinglog 2>/dev/null; then
               AVG=$(awk -F'/' '/rtt/ {print $5} END{if(NR==0) print ""}' /tmp/pinglog || echo "")
               if [ -n "$AVG" ]; then REAL_PING=$(printf "%.0f" "$AVG" 2>/dev/null || echo 9999); fi
             fi
 
-            # tcp rtt
+            # tcp rtt (استفاده از پورت پویا)
             TCP_RTT=9999
-            # LOGIC FIX: Use the DISCOVERED port, not the hard-coded one
             if [ "$TCP_TESTS" -gt 0 ]; then TCP_RTT=$(measure_tcp_rtt "$IP_CLEAN" "$PORT_CLEAN" "$TCP_TESTS" || echo 9999); fi
 
-            # TLS handshake
+            # TLS handshake (استفاده از پورت پویا)
             TLS_MS=9999
-            # LOGIC FIX: Use the DISCOVERED port
             TLS_MS=$(measure_tls "$IP_CLEAN" "$PORT_CLEAN" "$TLS_TIMEOUT" || echo 9999)
 
-            # HTTP health & throughput (try https then http)
+            # HTTP health & throughput (استفاده از پورت پویا)
             HTTP_PROTO="https"
-            # LOGIC FIX: Pass DISCOVERED port to function
             HEALTH_RES=$(measure_http_and_throughput "$HTTP_PROTO" "$IP_CLEAN" "$PORT_CLEAN" "$HEALTH_PATH" "$HEALTH_TIMEOUT" "$THROUGHPUT_BYTES" || echo "0,9999,0,000")
             HEALTH_OK=$(echo "$HEALTH_RES" | cut -d',' -f1)
             if [ "$HEALTH_OK" -eq 0 ]; then
               HTTP_PROTO="http"
-              # LOGIC FIX: Pass DISCOVERED port to function
               HEALTH_RES=$(measure_http_and_throughput "$HTTP_PROTO" "$IP_CLEAN" "$PORT_CLEAN" "$HEALTH_PATH" "$HEALTH_TIMEOUT" "$THROUGHPUT_BYTES" || echo "0,9999,0,000")
             fi
             HEALTH_OK=$(echo "$HEALTH_RES" | cut -d',' -f1)
@@ -345,8 +327,7 @@ jobs:
             THROUGHPUT_BPS=$(echo "$HEALTH_RES" | cut -d',' -f3)
             HEALTH_STATUS_CODE=$(echo "$HEALTH_RES" | cut -d',' -f4)
 
-            # stability
-            # LOGIC FIX: Pass DISCOVERED port to function
+            # stability (استفاده از پورت پویا)
             STAB=$(measure_stability "$IP_CLEAN" "$PORT_CLEAN" 3 "$HTTP_PROTO" "$HEALTH_PATH" "$HEALTH_TIMEOUT" || echo "0,0")
             PING_RATIO=$(echo "$STAB" | cut -d',' -f1)
             HTTP_RATIO=$(echo "$STAB" | cut -d',' -f2)
@@ -375,7 +356,7 @@ jobs:
             echo "${RAW_SCORE} ${LAT} ${REAL_PING} ${TCP_RTT} ${THROUGHPUT_BPS} ${TLS_MS} ${HEALTH_OK} ${HEALTH_LAT_MS} ${HEALTH_STATUS_CODE} ${PING_RATIO} ${HTTP_RATIO} ${GEO} ${IP_CLEAN}:${PORT_CLEAN}" >> "$SCORE_RAW"
 
             # append json ndjson line
-            # LOGIC FIX: Store IP:PORT
+            # ذخیره در فرمت IP:PORT
             jq -nc --arg ip_port "$IP_CLEAN:$PORT_CLEAN" --arg geo "$GEO" \
               --argjson lat "$LAT" --argjson realping "$REAL_PING" --argjson tcp "$TCP_RTT" \
               --argjson throughput "$THROUGHPUT_BPS" --argjson tls "$TLS_MS" \
