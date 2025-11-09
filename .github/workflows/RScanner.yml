@@ -1,4 +1,4 @@
-name: Rust Proxy Scanner - SmartPing Adaptive AI (D1 FIXED)
+name: Rust Proxy Scanner - SmartPing Adaptive AI (D1 FIXED - Source Builds)
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ permissions:
 env:
   TARGETS: ""
   USE_MASSCAN: "true"
-  USE_ZMAP: "false"
+  USE_ZMAP: "true"
   USE_RSCANNER: "false"
   SCAN_BINARY: ./target/release/RScanner
 
@@ -56,9 +56,9 @@ env:
 
 jobs:
   smartping:
-    name: Scan → Test → Score → Save to D1
+    name: Scan → Test → Score → Save to D1 (Source Builds)
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
 
     steps:
       - name: Checkout repository
@@ -66,76 +66,121 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install system dependencies
+      - name: Install base packages and build deps
         run: |
           set -euo pipefail
-          echo "📦 Installing system packages..."
-          
+          echo "📦 Updating apt and installing base packages..."
           sudo apt-get update -y
           sudo apt-get install -y \
-            jq curl geoip-bin build-essential pkg-config \
-            libssl-dev ca-certificates iputils-ping \
-            netcat-openbsd openssl nmap git cmake
+            git build-essential cmake make pkg-config \
+            libpcap-dev libgcrypt20-dev libssl-dev \
+            jq curl geoip-bin iputils-ping netcat-openbsd \
+            ca-certificates wget unzip bzip2
 
-          echo "✅ System packages installed"
+          # helpful tooling
+          sudo apt-get install -y nmap openssl
 
-      - name: Install Masscan
+          echo "✅ Base packages installed"
+
+      - name: Build Masscan from source
         if: env.USE_MASSCAN == 'true'
         run: |
           set -euo pipefail
-          if ! command -v masscan &>/dev/null; then
-            echo "📡 Installing Masscan..."
-            sudo apt-get install -y libpcap-dev
-            
-            rm -rf /tmp/masscan
-            git clone https://github.com/robertdavidgraham/masscan /tmp/masscan
-            cd /tmp/masscan
-            make -j"$(nproc)"
-            sudo cp bin/masscan /usr/local/bin/
-            
-            masscan --version
-            echo "✅ Masscan installed"
+          WORK=/tmp/masscan_build
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+          cd "$WORK"
+
+          echo "📡 Cloning Masscan..."
+          git clone --depth 1 https://github.com/robertdavidgraham/masscan.git . || {
+            echo "❌ masscan git clone failed"
+            exit 1
+          }
+
+          echo "🔧 Building Masscan (make -j)..."
+          # ensure required includes
+          export CFLAGS="-O2 -fPIC"
+          make -j"$(nproc)" || {
+            echo "❌ masscan build failed; dumping last 200 lines of build log"
+            tail -n 200 build.log || true
+            exit 1
+          }
+
+          if [ -f bin/masscan ]; then
+            sudo cp -f bin/masscan /usr/local/bin/masscan
+            sudo chmod +x /usr/local/bin/masscan
+            echo "✅ masscan installed to /usr/local/bin/masscan"
+            /usr/local/bin/masscan --version || true
           else
-            echo "✅ Masscan already installed"
+            echo "❌ masscan binary not found after build"
+            ls -la || true
+            exit 1
           fi
 
-      - name: Install ZMap
+      - name: Build ZMap from source
         if: env.USE_ZMAP == 'true'
         run: |
           set -euo pipefail
-          if ! command -v zmap &>/dev/null; then
-            echo "📡 Installing ZMap..."
-            sudo apt-get install -y libgcrypt20-dev libpcap-dev
-            
-            rm -rf /tmp/zmap
-            git clone https://github.com/zmap/zmap /tmp/zmap
-            cd /tmp/zmap
-            mkdir -p build
-            cd build
-            cmake ..
-            make -j"$(nproc)"
-            sudo cp src/zmap /usr/local/bin/
-            
-            zmap --version
-            echo "✅ ZMap installed"
+          WORK=/tmp/zmap_build
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+          cd "$WORK"
+
+          echo "🧭 Cloning ZMap..."
+          git clone --depth 1 https://github.com/zmap/zmap.git . || {
+            echo "❌ zmap git clone failed"
+            exit 1
+          }
+
+          echo "🔧 Preparing ZMap build..."
+          mkdir -p build
+          cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release || {
+            echo "❌ cmake configuration failed for zmap"
+            exit 1
+          }
+
+          echo "🔧 Building ZMap (make -j)..."
+          make -j"$(nproc)" || {
+            echo "❌ zmap make failed; listing build dir"
+            ls -la || true
+            exit 1
+          }
+
+          # built binary may be under src/
+          if [ -f src/zmap ]; then
+            sudo cp -f src/zmap /usr/local/bin/zmap
+            sudo chmod +x /usr/local/bin/zmap
+            echo "✅ zmap installed to /usr/local/bin/zmap"
+            /usr/local/bin/zmap --version || true
           else
-            echo "✅ ZMap already installed"
+            # try looking for other locations
+            FOUND=$(find . -type f -name zmap -perm -111 -print -quit || true)
+            if [ -n "$FOUND" ]; then
+              sudo cp -f "$FOUND" /usr/local/bin/zmap
+              sudo chmod +x /usr/local/bin/zmap
+              echo "✅ zmap installed from $FOUND"
+            else
+              echo "❌ zmap binary not found after build"
+              ls -la || true
+              exit 1
+            fi
           fi
 
-      - name: Install Rust toolchain
+      - name: Install Rust toolchain (optional, for RScanner)
         if: env.USE_RSCANNER == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
 
-      - name: Build RScanner
+      - name: Build RScanner (optional)
         if: env.USE_RSCANNER == 'true'
         run: |
           set -euo pipefail
           echo "🔨 Building RScanner..."
           cargo build --release
-          ls -lah target/release/
-          echo "✅ RScanner built"
+          ls -lah target/release/ || true
+          echo "✅ RScanner build finished"
 
       - name: Discovery Phase
         id: discover
@@ -143,13 +188,13 @@ jobs:
           set -euo pipefail
           TMPDIR=$(mktemp -d)
           trap 'rm -rf "$TMPDIR"' EXIT
-          
+
           OUT_DIR="${TMPDIR}/out"
           mkdir -p "$OUT_DIR"
-          
+
           echo "🔍 Starting discovery phase..."
           echo "Targets: ${TARGETS}"
-          
+
           : > "${OUT_DIR}/discovered.txt"
 
           # RScanner
@@ -168,9 +213,11 @@ jobs:
             else
               echo "⚠️  SKIP Masscan: TARGETS not set"
             fi
+          else
+            echo "⚠️ Masscan requested but not available"
           fi
 
-          # ZMap
+          # ZMap - note: zmap typically scans one prefix/target at a time
           if [ "${USE_ZMAP}" = "true" ] && command -v zmap &>/dev/null; then
             if [ -n "${TARGETS}" ]; then
               echo "Running ZMap..."
@@ -183,20 +230,22 @@ jobs:
             else
               echo "⚠️  SKIP ZMap: TARGETS not set"
             fi
+          else
+            echo "⚠️ ZMap requested but not available"
           fi
 
-          sort -u "${OUT_DIR}/discovered.txt" -o "${OUT_DIR}/discovered.txt"
-          
-          DISCOVERED_COUNT=$(wc -l < "${OUT_DIR}/discovered.txt")
+          sort -u "${OUT_DIR}/discovered.txt" -o "${OUT_DIR}/discovered.txt" || true
+
+          DISCOVERED_COUNT=$(wc -l < "${OUT_DIR}/discovered.txt" || echo 0)
           echo "✅ Discovered ${DISCOVERED_COUNT} unique IPs"
-          
+
           if [ "$DISCOVERED_COUNT" -eq 0 ]; then
             echo "⚠️  No IPs discovered"
           fi
-          
+
           mkdir -p "${GITHUB_WORKSPACE}/scan_results"
-          cp "${OUT_DIR}/discovered.txt" "${GITHUB_WORKSPACE}/scan_results/discovered.txt"
-          
+          cp "${OUT_DIR}/discovered.txt" "${GITHUB_WORKSPACE}/scan_results/discovered.txt" || true
+
           echo "discovered_file=${GITHUB_WORKSPACE}/scan_results/discovered.txt" >> "${GITHUB_OUTPUT}"
 
       - name: Run Nmap
@@ -207,12 +256,13 @@ jobs:
           DISC="${{ steps.discover.outputs.discovered_file }}"
           OUTDIR="${GITHUB_WORKSPACE}/scan_results"
           mkdir -p "$OUTDIR"
-          
+
           if [ ! -s "$DISC" ]; then
-            echo "⚠️  No discovered IPs for Nmap"
+            echo "⚠️  No discovered IPs for Nmap; skipping"
+            echo "nmap_results=" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
-          
+
           echo "🔍 Running Nmap service detection..."
           nmap -sV -O -Pn -iL "$DISC" -oA "$OUTDIR/nmap_results" || true
           echo "✅ Nmap completed"
@@ -228,7 +278,7 @@ jobs:
           DISC="${{ steps.discover.outputs.discovered_file }}"
           METRICS_FILE="${TMPDIR}/${{ env.METRICS_OUTPUT }}"
           SCORE_RAW="${TMPDIR}/score_raw.txt"
-          
+
           : > "$METRICS_FILE"
           : > "$SCORE_RAW"
 
@@ -237,10 +287,10 @@ jobs:
             exit 0
           fi
 
-          # Test functions
+          # (functions: retry_with_backoff, measure_tcp_rtt, measure_tls, measure_health, measure_single_throughput, measure_stability)
           retry_with_backoff() {
             local host="$1" port="$2"
-            local max_retries=5 delay=2 retries=0
+            local max_retries=5 delay=1 retries=0
             while [ $retries -lt $max_retries ]; do
               if timeout 1 bash -c "cat < /dev/tcp/${host}/${port} >/dev/null 2>&1"; then
                 return 0
@@ -282,21 +332,15 @@ jobs:
             local proto="$1" host="$2" path="$3" tout="$4"
             local out
             out=$(timeout "${tout}s" curl --max-time "${tout}" --insecure -sS -w "%{http_code},%{time_total}" -o /dev/null "${proto}://${host}${path}" 2>/dev/null) || out=""
-            
             if [ -z "$out" ]; then
               printf "0,9999,000"
               return 0
             fi
-            
             local http_code=$(echo "$out" | cut -d',' -f1)
             local time_total=$(echo "$out" | cut -d',' -f2)
             local ms=$(awk -v t="$time_total" 'BEGIN{printf("%d", t*1000)}')
             local health_ok=0
-            
-            if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 400 ]; then
-              health_ok=1
-            fi
-            
+            if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 400 ]; then health_ok=1; fi
             printf "%d,%s,%03d" "$health_ok" "$ms" "$http_code"
           }
 
@@ -308,12 +352,9 @@ jobs:
               --insecure -sS -w "%{time_total},%{size_download}" \
               -o /dev/null \
               "${url}?bytes=${bytes}" 2>/dev/null) || out=""
-            
             if [ -z "$out" ]; then echo 0; return 0; fi
-            
             local time_total=$(echo "$out" | cut -d',' -f1)
             local size_download=$(echo "$out" | cut -d',' -f2)
-            
             if awk "BEGIN{exit !($time_total>0 && $size_download==${THROUGHPUT_TEST_BYTES})}"; then
               local bps=$(awk -v b="$size_download" -v t="$time_total" 'BEGIN{printf("%d", (b*8)/t)}')
               echo "$bps"
@@ -325,22 +366,18 @@ jobs:
           measure_stability() {
             local host="$1" pings="$2" proto="$3" path="$4" tout="$5"
             local succ_ping=0
-            
             for i in $(seq 1 "$pings"); do
               if timeout 2 ping -c 1 -W 1 "$host" >/dev/null 2>&1; then
                 succ_ping=$((succ_ping+1))
               fi
             done
-            
             local ping_ratio=$(awk -v s="$succ_ping" -v t="$pings" 'BEGIN{printf("%.2f", (t>0)?s/t:0)}')
             local succ_http=0
-            
             for i in $(seq 1 "$pings"); do
               if timeout "${tout}s" curl --max-time "${tout}" --insecure -sS -o /dev/null -w "%{http_code}" "${proto}://${host}${path}" 2>/dev/null | awk '{exit ($1>=200 && $1<400)?0:1}'; then
                 succ_http=$((succ_http+1))
               fi
             done
-            
             local http_ratio=$(awk -v s="$succ_http" -v t="$pings" 'BEGIN{printf("%.2f", (t>0)?s/t:0)}')
             printf "%s,%s" "$ping_ratio" "$http_ratio"
           }
@@ -352,7 +389,7 @@ jobs:
           while read -r ip; do
             CURRENT=$((CURRENT+1))
             echo "Testing IP $CURRENT/$TOTAL_IPS: $ip"
-            
+
             IP_CLEAN="${ip}"
             LAT=9999
 
@@ -392,12 +429,10 @@ jobs:
             if [ "$HEALTH_OK" -eq 1 ]; then
               RAW_BPS_RESULTS="${TMPDIR}/bps_${IP_CLEAN}.txt"
               : > "$RAW_BPS_RESULTS"
-              
               for i in $(seq 1 "${THROUGHPUT_TEST_COUNT}"); do
                 bps_run=$(measure_single_throughput "$HTTP_PROTO" "$IP_CLEAN" "${THROUGHPUT_TEST_URL}" "${THROUGHPUT_TEST_BYTES}" "${THROUGHPUT_TIMEOUT}")
                 echo "$bps_run" >> "$RAW_BPS_RESULTS"
               done
-              
               MEDIAN_BPS=$(sort -n "$RAW_BPS_RESULTS" | awk '{a[NR]=$1} END{if(NR==0) print 0; else if(NR%2==1) print a[int(NR/2)+1]; else print int((a[NR/2]+a[NR/2+1])/2)}')
               THROUGHPUT_BPS=$(printf "%.0f" "$MEDIAN_BPS" 2>/dev/null || echo 0)
             fi
@@ -440,19 +475,36 @@ jobs:
               >> "$METRICS_FILE"
 
             if [ "${DEBUG}" = "true" ]; then
-              echo "  Score: $RAW_SCORE | Ping: $REAL_PING | TCP: $TCP_RTT | Health: $HEALTH_OK"
+              echo "  Score: $RAW_SCORE | Ping: $REAL_PING | TCP: $TCP_RTT | Health: $HEALTH_OK | Thr: $THROUGHPUT_BPS"
             fi
 
           done < "${DISC}"
 
           mkdir -p "${GITHUB_WORKSPACE}/scan_results"
-          cp "$METRICS_FILE" "${GITHUB_WORKSPACE}/scan_results/$(basename "$METRICS_FILE")"
-          cp "$SCORE_RAW" "${GITHUB_WORKSPACE}/scan_results/$(basename "$SCORE_RAW")"
+          cp "$METRICS_FILE" "${GITHUB_WORKSPACE}/scan_results/$(basename "$METRICS_FILE")" || true
+          cp "$SCORE_RAW" "${GITHUB_WORKSPACE}/scan_results/$(basename "$SCORE_RAW")" || true
 
           if [ -s "$METRICS_FILE" ]; then
-            jq -s 'sort_by(-.raw_score) | .[0:5]' "$METRICS_FILE" > "${GITHUB_WORKSPACE}/${{ env.SUMMARY_OUTPUT }}"
+            jq -s 'sort_by(-.raw_score) | .[0:5]' "$METRICS_FILE" > "${GITHUB_WORKSPACE}/${{ env.SUMMARY_OUTPUT }}" || true
             echo "✅ Top 5 results saved to summary"
+          else
+            echo "⚠️ No metrics generated"
           fi
+
+      - name: Setup Node (for Wrangler) and Install Wrangler
+        if: always()
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Wrangler CLI
+        if: always()
+        run: |
+          set -euo pipefail
+          npm install -g wrangler@latest
+          wrangler --version || { echo "❌ Wrangler installation failed"; exit 1; }
+          echo "✅ Wrangler installed"
 
       - name: Initialize and Save to Cloudflare D1
         if: always()
@@ -463,76 +515,41 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "🔧 Installing Wrangler..."
-          
-          # Install Node.js 18 (required for Wrangler)
-          curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
-          sudo apt-get install -y nodejs
-          
-          # Install Wrangler globally
-          sudo npm install -g wrangler@latest
-          
-          # Verify installation
-          wrangler --version || {
-            echo "❌ Wrangler installation failed"
-            exit 1
-          }
-
-          echo "✅ Wrangler installed successfully"
-
-          # Verify secrets are set
-          if [ -z "${CLOUDFLARE_API_TOKEN}" ] || [ -z "${CF_ACCOUNT_ID}" ] || [ -z "${D1_DB_NAME}" ]; then
-            echo "❌ Missing required secrets:"
-            echo "   CF_API_TOKEN: ${CLOUDFLARE_API_TOKEN:+SET}"
-            echo "   CF_ACCOUNT_ID: ${CF_ACCOUNT_ID:+SET}"
-            echo "   D1_DB_NAME: ${D1_DB_NAME:+SET}"
-            exit 1
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CF_ACCOUNT_ID:-}" ] || [ -z "${D1_DB_NAME:-}" ]; then
+            echo "❌ Missing required secrets - skipping D1 initialization"
+            exit 0
           fi
 
-          echo "🗄️  Initializing D1 database schema..."
-
-          # Create table schema
           cat > create_table.sql <<'EOF'
-          CREATE TABLE IF NOT EXISTS proxy_updates (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ip TEXT NOT NULL,
-            score REAL NOT NULL,
-            geo TEXT,
-            latency INTEGER,
-            throughput INTEGER,
-            updated_at TEXT NOT NULL,
-            UNIQUE(ip, updated_at)
-          );
-          
-          CREATE INDEX IF NOT EXISTS idx_score ON proxy_updates(score DESC);
-          CREATE INDEX IF NOT EXISTS idx_updated_at ON proxy_updates(updated_at DESC);
-          EOF
+CREATE TABLE IF NOT EXISTS proxy_updates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ip TEXT NOT NULL,
+  score REAL NOT NULL,
+  geo TEXT,
+  latency INTEGER,
+  throughput INTEGER,
+  updated_at TEXT NOT NULL,
+  UNIQUE(ip, updated_at)
+);
 
-          echo "📝 Table schema:"
-          cat create_table.sql
+CREATE INDEX IF NOT EXISTS idx_score ON proxy_updates(score DESC);
+CREATE INDEX IF NOT EXISTS idx_updated_at ON proxy_updates(updated_at DESC);
+EOF
 
-          # Execute schema creation
-          echo "Creating table in D1..."
-          wrangler d1 execute "${D1_DB_NAME}" \
-            --remote \
-            --file=create_table.sql 2>&1 | tee schema_output.log
-
-          if grep -qi "error" schema_output.log; then
-            echo "⚠️  Schema creation had issues (may already exist)"
+          wrangler d1 execute "${D1_DB_NAME}" --remote --file=create_table.sql 2>&1 | tee schema_output.log || true
+          if grep -qi "error" schema_output.log || grep -qi "failed" schema_output.log; then
+            echo "⚠️ Schema creation reported errors/warnings (may already exist)"
+            tail -n 50 schema_output.log || true
           else
-            echo "✅ Table schema initialized"
+            echo "✅ Table schema initialized (or already exists)"
           fi
 
-          # Process and insert best IP
           SUMMARY_FILE="${GITHUB_WORKSPACE}/${{ env.SUMMARY_OUTPUT }}"
-
           if [ ! -s "$SUMMARY_FILE" ]; then
             echo "⚠️  No summary file - skipping data insert"
             exit 0
           fi
 
-          echo "📊 Reading scan results..."
-          
           BEST_IP=$(jq -r '.[0].ip // empty' "$SUMMARY_FILE")
           BEST_SCORE=$(jq -r '.[0].raw_score // 0' "$SUMMARY_FILE")
           BEST_GEO=$(jq -r '.[0].geo // "XX"' "$SUMMARY_FILE")
@@ -544,53 +561,30 @@ jobs:
             exit 0
           fi
 
-          echo "🌐 Best IP: $BEST_IP"
-          echo "   Score: $BEST_SCORE"
-          echo "   Geo: $BEST_GEO"
-          echo "   Ping: $BEST_PING ms"
-          echo "   Throughput: $BEST_THR bps"
-
-          # Create insert SQL with proper escaping
           cat > insert_data.sql <<EOF
-          INSERT INTO proxy_updates (ip, score, geo, latency, throughput, updated_at)
-          VALUES (
-            '$(echo "$BEST_IP" | sed "s/'/''/g")',
-            $BEST_SCORE,
-            '$(echo "$BEST_GEO" | sed "s/'/''/g")',
-            $BEST_PING,
-            $BEST_THR,
-            datetime('now')
-          );
-          EOF
+INSERT INTO proxy_updates (ip, score, geo, latency, throughput, updated_at)
+VALUES (
+  '$(echo "$BEST_IP" | sed "s/'/''/g")',
+  $BEST_SCORE,
+  '$(echo "$BEST_GEO" | sed "s/'/''/g")',
+  $BEST_PING,
+  $BEST_THR,
+  datetime('now')
+);
+EOF
 
-          echo "📝 Insert SQL:"
-          cat insert_data.sql
-
-          # Execute insert
-          echo "💾 Inserting data into D1..."
-          wrangler d1 execute "${D1_DB_NAME}" \
-            --remote \
-            --file=insert_data.sql 2>&1 | tee insert_output.log
-
-          if grep -qi "error" insert_output.log; then
-            echo "❌ Data insert failed"
-            cat insert_output.log
+          wrangler d1 execute "${D1_DB_NAME}" --remote --file=insert_data.sql 2>&1 | tee insert_output.log || true
+          if grep -qi "error" insert_output.log || grep -qi "failed" insert_output.log; then
+            echo "❌ Data insert reported errors:"
+            tail -n 50 insert_output.log || true
             exit 1
           fi
 
-          echo "✅ Data inserted successfully"
-
-          # Verify insert
-          echo "🔍 Verifying data..."
           cat > verify.sql <<EOF
-          SELECT * FROM proxy_updates ORDER BY updated_at DESC LIMIT 5;
-          EOF
-
-          wrangler d1 execute "${D1_DB_NAME}" \
-            --remote \
-            --file=verify.sql 2>&1 | tee verify_output.log
-
-          echo "✅ D1 Database updated successfully!"
+SELECT * FROM proxy_updates ORDER BY updated_at DESC LIMIT 5;
+EOF
+          wrangler d1 execute "${D1_DB_NAME}" --remote --file=verify.sql 2>&1 | tee verify_output.log || true
+          echo "✅ D1 Database updated (verify output above)"
 
       - name: Upload Artifacts
         if: always()
