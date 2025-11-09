@@ -1,9 +1,20 @@
-name: Rust Proxy Scanner - SmartPing Adaptive AI (D1 only) - FINAL
+# .github/workflows/rust-proxy-smartping-final.yml
+name: Rust Proxy Scanner - SmartPing Adaptive AI (D1 Integration) - FINAL
 
 on:
   workflow_dispatch:
+    inputs:
+      targets:
+        description: 'Target IPs/CIDR (comma-separated, e.g., 198.51.100.0/24,203.0.113.5)'
+        required: false
+        type: string
+      debug_mode:
+        description: 'Enable debug output'
+        required: false
+        type: boolean
+        default: false
   schedule:
-    - cron: '0 */6 * * *' # every 6 hours
+    - cron: '0 */6 * * *' # Run every 6 hours
 
 concurrency:
   group: rust-proxy-smartping-d1-final
@@ -14,383 +25,887 @@ permissions:
   actions: write
 
 env:
-  # Core scanner
+  # ============================================================================
+  # CONFIGURATION SECTION - Modify these values before running
+  # ============================================================================
+  
+  # Target Configuration
+  # CRITICAL: Set your target IPs/CIDR ranges here
+  # Example: "198.51.100.0/24,203.0.113.5,192.0.2.0/28"
+  TARGETS: "${{ github.event.inputs.targets || '' }}"
+  
+  # Scanner Selection (enable/disable scanning tools)
+  USE_MASSCAN: "true"          # Enable masscan for fast port scanning
+  USE_ZMAP: "false"             # Enable zmap (requires elevated permissions and resources)
+  USE_RSCANNER: "false"         # Enable custom RScanner (if available locally)
   SCAN_BINARY: ./target/release/RScanner
-  SCAN_LOG: scan.log
-  SCANNER_TIMEOUT: "600"        # seconds
+  
+  # Core Scanner Settings
+  SCANNER_TIMEOUT: "600"        # Maximum scan duration in seconds
+  MASSCAN_RATE: "10000"         # Packets per second for masscan
+  ZMAP_BANDWIDTH: "50M"         # Bandwidth limit for zmap
+  
+  # Geographic Priority Locations
   PRIORITY_LOCATIONS: "US,DE,GB,NL,FR,SG,JP,CA,AU,CH"
-  REAL_PING_TESTS: "3"
-
-  # D1 update retry policy
-  MAX_D1_RETRIES: "5"
-  D1_RETRY_SLEEP: "2"
-
-  # TCP test
-  TCP_CONNECT_TESTS: "1"
-  # پورت‌ها دیگر از env خوانده نمی‌شوند، پورت 443 به صورت ثابت استفاده خواهد شد
-
-  # HTTP / throughput / TLS
+  
+  # Testing Configuration
+  REAL_PING_TESTS: "3"          # Number of ICMP ping tests per host
+  TCP_CONNECT_TESTS: "2"        # Number of TCP connection attempts
+  TCP_TEST_PORT: "443"          # Port for TCP RTT testing
+  
+  # Health Check Settings
   HEALTH_URL_PATH: "/favicon.ico"
-  HEALTH_HTTP_TIMEOUT: "5"
-  THROUGHPUT_MAX_BYTES: "200000"
-  TLS_TIMEOUT: "5"
-
-  # Scoring weights (sensible defaults; adjust if you want a different policy)
-  W_SCANNER_LATENCY: "0.18"
-  W_REAL_PING: "0.22"
-  W_TCP_RTT: "0.05"
-  W_THROUGHPUT: "0.25"
-  W_TLS_HANDSHAKE: "0.10"
-  W_HEALTH: "0.10"
-  W_STABILITY: "0.05"
-  W_COST: "0.00"         # default neutral; set >0 and provide cost metadata if you want cost weighting
-  W_GEO_BONUS: "200"
-
-  # Behavior flags
-  DRY_RUN: "false"       # when "true" skip writing to D1
-  DEBUG: "false"         # when "true" emits verbose logs
-
-  # Output files
+  HEALTH_HTTP_TIMEOUT: "5"      # Timeout in seconds for HTTP health checks
+  TLS_TEST_PORT: "443"
+  TLS_TIMEOUT: "5"              # Timeout in seconds for TLS handshake
+  
+  # Throughput Testing
+  THROUGHPUT_TEST_URL: "https://speed.cloudflare.com/__down"
+  THROUGHPUT_TEST_BYTES: "10000000"  # 10 MB download test
+  THROUGHPUT_TEST_COUNT: "3"    # Number of throughput measurements
+  THROUGHPUT_TIMEOUT: "30"      # Timeout per throughput test
+  
+  # Scoring Weights (must sum to ~1.0 for normalized scoring)
+  W_SCANNER_LATENCY: "0.18"     # Weight for initial scanner latency
+  W_REAL_PING: "0.22"           # Weight for ICMP ping latency
+  W_TCP_RTT: "0.05"             # Weight for TCP round-trip time
+  W_THROUGHPUT: "0.25"          # Weight for bandwidth throughput
+  W_TLS_HANDSHAKE: "0.10"       # Weight for TLS handshake speed
+  W_HEALTH: "0.10"              # Weight for HTTP health check
+  W_STABILITY: "0.05"           # Weight for connection stability
+  W_GEO_BONUS: "200"            # Bonus points for priority locations
+  
+  # Behavior Flags
+  DRY_RUN: "false"              # If true, simulate without actual scanning
+  DEBUG: "${{ github.event.inputs.debug_mode || 'false' }}"
+  
+  # Output Files
   METRICS_OUTPUT: "metrics.ndjson"
   SUMMARY_OUTPUT: "scan_summary.json"
+  MAX_RESULTS: "50"             # Maximum number of results to keep
 
 jobs:
   smartping:
-    name: Build → Scan → Advanced Tests → Score → Update Cloudflare D1
+    name: Build → Discover → Scan → Test → Score → Save to D1
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
-      - name: Checkout repository (full)
+      # ========================================================================
+      # STEP 1: Repository Checkout
+      # ========================================================================
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Install system dependencies
+      # ========================================================================
+      # STEP 2: System Dependencies Installation
+      # ========================================================================
+      - name: Install system dependencies and scanning tools
         run: |
           set -euo pipefail
+          
+          echo "::group::Installing base system packages"
           sudo apt-get update -y
-          sudo apt-get install -y jq curl geoip-bin build-essential pkg-config libssl-dev ca-certificates coreutils iputils-ping netcat-openbsd openssl
-          if ! command -v geoiplookup &>/dev/null; then
-            echo "❌ geoiplookup not found after install!"
-            exit 1
+          sudo apt-get install -y \
+            jq curl geoip-bin build-essential pkg-config \
+            libssl-dev ca-certificates coreutils iputils-ping \
+            netcat-openbsd openssl nmap git parallel \
+            libpcap-dev libgcrypt20-dev
+          echo "::endgroup::"
+          
+          # Install masscan if enabled
+          if [ "${{ env.USE_MASSCAN }}" = "true" ]; then
+            echo "::group::Installing masscan"
+            if ! command -v masscan &>/dev/null; then
+              git clone --depth 1 https://github.com/robertdavidgraham/masscan /tmp/masscan
+              cd /tmp/masscan
+              make -j$(nproc)
+              sudo cp bin/masscan /usr/local/bin/
+              masscan --version || echo "Warning: masscan installed but version check failed"
+            else
+              echo "masscan already installed"
+            fi
+            echo "::endgroup::"
           fi
-          echo "✅ System dependencies installed"
+          
+          # Install zmap if enabled
+          if [ "${{ env.USE_ZMAP }}" = "true" ]; then
+            echo "::group::Installing zmap"
+            if ! command -v zmap &>/dev/null; then
+              git clone --depth 1 https://github.com/zmap/zmap /tmp/zmap
+              cd /tmp/zmap
+              mkdir -p build && cd build
+              cmake .. && make -j$(nproc)
+              sudo cp src/zmap /usr/local/bin/
+              zmap --version || echo "Warning: zmap installed but version check failed"
+            else
+              echo "zmap already installed"
+            fi
+            echo "::endgroup::"
+          fi
+          
+          # Install httpx (ProjectDiscovery) - optional but useful
+          echo "::group::Installing httpx"
+          if ! command -v httpx &>/dev/null; then
+            GO111MODULE=on go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest 2>/dev/null || \
+              echo "httpx installation failed (optional tool)"
+          fi
+          echo "::endgroup::"
+          
+          echo "✅ System and scanning tools installation complete"
 
-      - name: Install Rust toolchain (stable)
+      # ========================================================================
+      # STEP 3: Rust Toolchain Setup (if RScanner is enabled)
+      # ========================================================================
+      - name: Install Rust toolchain
+        if: env.USE_RSCANNER == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
 
-      - name: Cache Rust artifacts and registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            target
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: rust-cache-final-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            rust-cache-final-${{ runner.os }}-
-
-      - name: Build Rust scanner (release)
+      - name: Build RScanner
+        if: env.USE_RSCANNER == 'true'
         run: |
           set -euo pipefail
-          echo "=> cargo build --release"
-          if ! cargo build --release 2>&1 | tee build-output.log; then
-            echo "❌ Cargo build failed. Showing last 200 lines:"
-            tail -n 200 build-output.log || true
-            exit 1
-          fi
+          echo "::group::Building RScanner"
+          cargo build --release --verbose
           ls -lah target/release/ || true
-          if [ ! -f "${{ env.SCAN_BINARY }}" ]; then
-            echo "❌ Scanner binary not found at ${{ env.SCAN_BINARY }}"
+          if [ ! -x "${{ env.SCAN_BINARY }}" ]; then
+            echo "::error::RScanner binary not found or not executable"
             exit 1
           fi
-          echo "✅ Build successful"
+          echo "::endgroup::"
 
-      - name: Run scanner & perform advanced tests + scoring
-        id: scan
-        timeout-minutes: 40
+      # ========================================================================
+      # STEP 4: Input Validation
+      # ========================================================================
+      - name: Validate inputs
+        id: validate
         run: |
           set -euo pipefail
-          shopt -s nocasematch || true
+          
+          echo "::group::Input validation"
+          
+          # Check if at least one scanner is enabled
+          if [ "${{ env.USE_MASSCAN }}" != "true" ] && \
+             [ "${{ env.USE_ZMAP }}" != "true" ] && \
+             [ "${{ env.USE_RSCANNER }}" != "true" ]; then
+            echo "::error::No scanner enabled! Enable at least one scanner."
+            exit 1
+          fi
+          
+          # Validate targets are provided
+          if [ -z "${{ env.TARGETS }}" ]; then
+            echo "::warning::No targets specified. Workflow will run but produce no results."
+            echo "has_targets=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_targets=true" >> $GITHUB_OUTPUT
+            echo "Targets configured: ${{ env.TARGETS }}"
+          fi
+          
+          # Validate Cloudflare credentials
+          if [ -z "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" ] || \
+             [ -z "${{ secrets.CLOUDFLARE_API_TOKEN }}" ] || \
+             [ -z "${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}" ]; then
+            echo "::warning::Cloudflare D1 credentials not configured. Results will not be saved to D1."
+            echo "d1_enabled=false" >> $GITHUB_OUTPUT
+          else
+            echo "d1_enabled=true" >> $GITHUB_OUTPUT
+            echo "✅ Cloudflare D1 integration enabled"
+          fi
+          
+          # Validate scoring weights sum
+          WEIGHT_SUM=$(awk -v w1="${{ env.W_SCANNER_LATENCY }}" \
+                           -v w2="${{ env.W_REAL_PING }}" \
+                           -v w3="${{ env.W_TCP_RTT }}" \
+                           -v w4="${{ env.W_THROUGHPUT }}" \
+                           -v w5="${{ env.W_TLS_HANDSHAKE }}" \
+                           -v w6="${{ env.W_HEALTH }}" \
+                           -v w7="${{ env.W_STABILITY }}" \
+                           'BEGIN{print w1+w2+w3+w4+w5+w6+w7}')
+          
+          echo "Total scoring weight: $WEIGHT_SUM"
+          if ! awk -v sum="$WEIGHT_SUM" 'BEGIN{exit !(sum >= 0.95 && sum <= 1.05)}'; then
+            echo "::warning::Scoring weights sum to $WEIGHT_SUM (expected ~1.0)"
+          fi
+          
+          echo "::endgroup::"
 
-          # --- envs ---
-          BIN="${{ env.SCAN_BINARY }}"
-          LOG="${{ env.SCAN_LOG }}"
-          TMPDIR=$(mktemp -d)
-          trap 'rm -rf "$TMPDIR"' EXIT
+      # ========================================================================
+      # STEP 5: Discovery Phase (Masscan/ZMap/RScanner)
+      # ========================================================================
+      - name: Discovery phase - scan for live hosts
+        id: discover
+        if: steps.validate.outputs.has_targets == 'true'
+        run: |
+          set -euo pipefail
+          
+          # Create working directories
+          WORK_DIR="${RUNNER_TEMP}/scanner_work"
+          mkdir -p "${WORK_DIR}"
+          DISCOVERED_FILE="${WORK_DIR}/discovered.txt"
+          : > "${DISCOVERED_FILE}"
+          
+          echo "::group::Discovery scanning"
+          
+          # Helper function to extract and deduplicate IPs
+          extract_ips() {
+            grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | \
+            awk '{
+              split($0, octets, ".")
+              if (octets[1]>=0 && octets[1]<=255 && 
+                  octets[2]>=0 && octets[2]<=255 && 
+                  octets[3]>=0 && octets[3]<=255 && 
+                  octets[4]>=0 && octets[4]<=255)
+                print $0
+            }' | sort -u
+          }
+          
+          # RScanner discovery
+          if [ "${{ env.USE_RSCANNER }}" = "true" ] && [ -x "${{ env.SCAN_BINARY }}" ]; then
+            echo "Running RScanner..."
+            timeout ${{ env.SCANNER_TIMEOUT }}s "${{ env.SCAN_BINARY }}" \
+              > "${WORK_DIR}/rscanner.log" 2>&1 || true
+            cat "${WORK_DIR}/rscanner.log" | extract_ips >> "${DISCOVERED_FILE}" || true
+          fi
+          
+          # Masscan discovery
+          if [ "${{ env.USE_MASSCAN }}" = "true" ] && command -v masscan &>/dev/null; then
+            if [ -n "${{ env.TARGETS }}" ]; then
+              echo "Running masscan on targets: ${{ env.TARGETS }}"
+              sudo masscan -p80,443,8080,8443 ${{ env.TARGETS }} \
+                --rate ${{ env.MASSCAN_RATE }} \
+                --wait 3 \
+                --open-only \
+                -oL "${WORK_DIR}/masscan.txt" 2>&1 || true
+              
+              if [ -f "${WORK_DIR}/masscan.txt" ]; then
+                cat "${WORK_DIR}/masscan.txt" | extract_ips >> "${DISCOVERED_FILE}" || true
+              fi
+            fi
+          fi
+          
+          # ZMap discovery (use with caution!)
+          if [ "${{ env.USE_ZMAP }}" = "true" ] && command -v zmap &>/dev/null; then
+            if [ -n "${{ env.TARGETS }}" ]; then
+              echo "::warning::Running zmap - ensure you have proper authorization!"
+              IFS=',' read -ra TARGET_ARRAY <<< "${{ env.TARGETS }}"
+              for target in "${TARGET_ARRAY[@]}"; do
+                target=$(echo "$target" | xargs) # trim whitespace
+                echo "Scanning: $target"
+                sudo zmap -p 443 "$target" \
+                  -B ${{ env.ZMAP_BANDWIDTH }} \
+                  -o "${WORK_DIR}/zmap_${target//\//_}.txt" 2>&1 || true
+                
+                if [ -f "${WORK_DIR}/zmap_${target//\//_}.txt" ]; then
+                  cat "${WORK_DIR}/zmap_${target//\//_}.txt" | extract_ips >> "${DISCOVERED_FILE}" || true
+                fi
+              done
+            fi
+          fi
+          
+          # Deduplicate and validate discovered IPs
+          sort -u "${DISCOVERED_FILE}" -o "${DISCOVERED_FILE}"
+          DISCOVERED_COUNT=$(wc -l < "${DISCOVERED_FILE}")
+          
+          echo "::endgroup::"
+          echo "📊 Discovered $DISCOVERED_COUNT unique IP addresses"
+          
+          if [ "${{ env.DEBUG }}" = "true" ]; then
+            echo "::group::Discovered IPs"
+            cat "${DISCOVERED_FILE}"
+            echo "::endgroup::"
+          fi
+          
+          # Save results
+          mkdir -p "${GITHUB_WORKSPACE}/scan_results"
+          cp "${DISCOVERED_FILE}" "${GITHUB_WORKSPACE}/scan_results/discovered.txt"
+          
+          echo "discovered_file=${GITHUB_WORKSPACE}/scan_results/discovered.txt" >> $GITHUB_OUTPUT
+          echo "discovered_count=${DISCOVERED_COUNT}" >> $GITHUB_OUTPUT
 
-          LOCS="${{ env.PRIORITY_LOCATIONS }}"
-          TIMEOUT="${{ env.SCANNER_TIMEOUT }}"
-          REAL_PING_TESTS="${{ env.REAL_PING_TESTS }}"
-          TCP_TESTS="${{ env.TCP_CONNECT_TESTS }}"
-          HEALTH_PATH="${{ env.HEALTH_URL_PATH }}"
-          HEALTH_TIMEOUT="${{ env.HEALTH_HTTP_TIMEOUT }}"
-          THROUGHPUT_BYTES="${{ env.THROUGHPUT_MAX_BYTES }}"
-          TLS_TIMEOUT="${{ env.TLS_TIMEOUT }}"
+      # ========================================================================
+      # STEP 6: Nmap Service Detection
+      # ========================================================================
+      - name: Nmap service and version detection
+        if: steps.discover.outputs.discovered_count > 0
+        id: nmap
+        run: |
+          set -euo pipefail
+          
+          DISC_FILE="${{ steps.discover.outputs.discovered_file }}"
+          OUT_DIR="${GITHUB_WORKSPACE}/scan_results"
+          
+          if [ ! -s "$DISC_FILE" ]; then
+            echo "No discovered IPs for nmap scanning"
+            exit 0
+          fi
+          
+          echo "::group::Nmap scanning"
+          echo "Running nmap service detection on $(wc -l < "$DISC_FILE") hosts..."
+          
+          nmap -sV -sC -T4 -Pn \
+            --max-retries 2 \
+            --host-timeout 5m \
+            --open \
+            -iL "$DISC_FILE" \
+            -oA "$OUT_DIR/nmap_results" 2>&1 | tee "$OUT_DIR/nmap.log" || true
+          
+          echo "::endgroup::"
+          echo "✅ Nmap scan complete"
+          
+          if [ -f "$OUT_DIR/nmap_results.xml" ]; then
+            echo "nmap_xml=$OUT_DIR/nmap_results.xml" >> $GITHUB_OUTPUT
+          fi
 
-          # weights
-          W_SCANNER_LATENCY="${{ env.W_SCANNER_LATENCY }}"
-          W_REAL_PING="${{ env.W_REAL_PING }}"
-          W_TCP_RTT="${{ env.W_TCP_RTT }}"
-          W_THROUGHPUT="${{ env.W_THROUGHPUT }}"
-          W_TLS_HANDSHAKE="${{ env.W_TLS_HANDSHAKE }}"
-          W_HEALTH="${{ env.W_HEALTH }}"
-          W_STABILITY="${{ env.W_STABILITY }}"
-          W_COST="${{ env.W_COST }}"
-          W_GEO_BONUS="${{ env.W_GEO_BONUS }}"
-
-          DRY_RUN="${{ env.DRY_RUN }}"
-          DEBUG="${{ env.DEBUG }}"
-          METRICS_FILE="${TMPDIR}/${{ env.METRICS_OUTPUT }}"
-          SUMMARY="${{ env.SUMMARY_OUTPUT }}"
-          SCORE_RAW="${TMPDIR}/score_raw.txt"
-
-          : > "$LOG"
+      # ========================================================================
+      # STEP 7: Advanced Testing and Scoring
+      # ========================================================================
+      - name: Advanced tests and intelligent scoring
+        if: steps.discover.outputs.discovered_count > 0
+        id: advanced
+        run: |
+          set -euo pipefail
+          
+          WORK_DIR="${RUNNER_TEMP}/testing"
+          mkdir -p "${WORK_DIR}"
+          
+          DISC_FILE="${{ steps.discover.outputs.discovered_file }}"
+          METRICS_FILE="${WORK_DIR}/${{ env.METRICS_OUTPUT }}"
+          SCORES_FILE="${WORK_DIR}/scores.txt"
+          
           : > "$METRICS_FILE"
-          : > "$SCORE_RAW"
-
-          if [ ! -x "$BIN" ]; then chmod +x "$BIN" || true; fi
-
-          echo "=> Running scanner with timeout ${TIMEOUT}s"
-          # run scanner (don't fail the step if it times out; we still want to parse whatever output it produced)
-          timeout "${TIMEOUT}s" "$BIN" > "$LOG" 2>&1 || true
-          echo "=> Scanner finished (or timed out). Log saved to $LOG"
-
-          # --- helper functions (آماده برای دریافت پورت پویا) ---
-
-          retry_with_backoff() {
+          : > "$SCORES_FILE"
+          
+          echo "::group::Advanced testing functions"
+          
+          # ====================================================================
+          # Testing Functions
+          # ====================================================================
+          
+          # TCP connection with retry and backoff
+          retry_tcp_connect() {
             local host="$1"
             local port="$2"
-            local max_retries=2
+            local max_attempts=5
             local delay=1
-            local retries=0
-            while [ $retries -lt $max_retries ]; do
-              if timeout 1 bash -c "cat < /dev/tcp/${host}/${port} >/dev/null 2>&1"; then
+            
+            for attempt in $(seq 1 $max_attempts); do
+              if timeout 2 bash -c "exec 3<>/dev/tcp/${host}/${port} 2>/dev/null" 2>/dev/null; then
                 return 0
               fi
-              retries=$((retries + 1))
               sleep $delay
               delay=$((delay * 2))
             done
             return 1
           }
-
+          
+          # Measure TCP RTT with multiple attempts
           measure_tcp_rtt() {
-            host="$1"; port="$2"; attempts="$3"
-            best=9999
+            local host="$1"
+            local port="$2"
+            local attempts="$3"
+            local best_ms=9999
+            
             for i in $(seq 1 "$attempts"); do
-              if retry_with_backoff "$host" "$port"; then
-                start=$(date +%s%3N)
-                timeout 2 bash -c "exec 3<>/dev/tcp/${host}/${port}" >/dev/null 2>&1 || true
-                end=$(date +%s%3N)
-                rtt=$((end-start))
-                if [ "$rtt" -lt "$best" ]; then best=$rtt; fi
+              if retry_tcp_connect "$host" "$port"; then
+                local start=$(date +%s%3N)
+                timeout 3 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null || continue
+                local end=$(date +%s%3N)
+                local rtt=$((end - start))
+                
+                if [ "$rtt" -lt "$best_ms" ] && [ "$rtt" -gt 0 ]; then
+                  best_ms=$rtt
+                fi
               fi
             done
-            echo "$best"
+            
+            echo "$best_ms"
           }
-
-          measure_tls() {
-            host="$1"; port="$2"; tout="$3"
-            start=$(date +%s%3N)
-            if timeout "${tout}s" bash -c "echo | openssl s_client -connect ${host}:${port} -servername google.com >/dev/null 2>&1"; then
-              end=$(date +%s%3N)
-              echo $((end-start))
+          
+          # Measure TLS handshake time
+          measure_tls_handshake() {
+            local host="$1"
+            local port="$2"
+            local timeout_sec="$3"
+            
+            local start=$(date +%s%3N)
+            if timeout "${timeout_sec}s" bash -c \
+              "echo | openssl s_client -connect ${host}:${port} -servername ${host} 2>&1 | grep -q 'Verify return code'" \
+              2>/dev/null; then
+              local end=$(date +%s%3N)
+              echo $((end - start))
             else
               echo 9999
             fi
           }
-
-          measure_http_and_throughput() {
-            proto="$1"; host="$2"; port="$3"; path="$4"; tout="$5"; max_bytes="$6"
-            TMP_BODY="${TMPDIR}/http_body_$$"
-            : > "$TMP_BODY"
-            out=$(timeout "${tout}s" curl --max-time "${tout}" --insecure -sS -w "%{http_code},%{time_total},%{size_download}" -o "$TMP_BODY" "${proto}://${host}:${port}${path}" 2>/dev/null) || out=""
-            if [ -z "$out" ]; then
-              printf "0,9999,0,000"
-              return 0
+          
+          # HTTP/HTTPS health check
+          measure_health_check() {
+            local proto="$1"
+            local host="$2"
+            local path="$3"
+            local timeout_sec="$4"
+            
+            local result
+            result=$(timeout "${timeout_sec}s" curl \
+              --max-time "${timeout_sec}" \
+              --connect-timeout 3 \
+              --insecure \
+              --silent \
+              --show-error \
+              --write-out "%{http_code},%{time_total}" \
+              --output /dev/null \
+              "${proto}://${host}${path}" 2>/dev/null) || result="000,9999"
+            
+            local http_code=$(echo "$result" | cut -d',' -f1)
+            local time_sec=$(echo "$result" | cut -d',' -f2)
+            local time_ms=$(awk -v t="$time_sec" 'BEGIN{printf("%d", t*1000)}')
+            local is_healthy=0
+            
+            if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 500 ]; then
+              is_healthy=1
             fi
-            http_code=$(echo "$out" | cut -d',' -f1)
-            time_total=$(echo "$out" | cut -d',' -f2)
-            size_download=$(echo "$out" | cut -d',' -f3)
-            ms=$(awk -v t="$time_total" 'BEGIN{printf("%d", t*1000)}')
-            if awk "BEGIN{exit !($time_total>0)}"; then
-              bps=$(awk -v b="$size_download" -v t="$time_total" 'BEGIN{printf("%d", (b*8)/t)}')
-            else
-              bps=0
-            fi
-            health_ok=0
-            if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 400 ]; then health_ok=1; fi
-            printf "%d,%s,%d,%03d" "$health_ok" "$ms" "$bps" "$http_code"
-            return 0
+            
+            printf "%d,%d,%s" "$is_healthy" "$time_ms" "$http_code"
           }
-
+          
+          # Throughput test
+          measure_throughput() {
+            local proto="$1"
+            local host="$2"
+            local url="$3"
+            local bytes="$4"
+            local timeout_sec="$5"
+            
+            local result
+            result=$(timeout "${timeout_sec}s" curl \
+              --max-time "${timeout_sec}" \
+              --proxy "${proto}://${host}" \
+              --insecure \
+              --silent \
+              --show-error \
+              --write-out "%{time_total},%{size_download}" \
+              --output /dev/null \
+              "${url}?bytes=${bytes}" 2>/dev/null) || result="0,0"
+            
+            local time_sec=$(echo "$result" | cut -d',' -f1)
+            local downloaded=$(echo "$result" | cut -d',' -f2)
+            
+            if awk "BEGIN{exit !($time_sec > 0 && $downloaded >= ${bytes}*0.9)}" 2>/dev/null; then
+              awk -v b="$downloaded" -v t="$time_sec" 'BEGIN{printf("%d", (b*8)/t)}'
+            else
+              echo 0
+            fi
+          }
+          
+          # Connection stability test
           measure_stability() {
-            host="$1"; port="$2"; pings="$3"; proto="$4"; path="$5"; tout="$6"
-            succ_ping=0
-            for i in $(seq 1 "$pings"); do
-              if timeout 2 ping -c 1 -W 1 "$host" >/dev/null 2>&1; then succ_ping=$((succ_ping+1)); fi
-            done
-            ping_ratio=$(awk -v s="$succ_ping" -v t="$pings" 'BEGIN{printf("%.2f", (t>0)?s/t:0)}')
-            succ_http=0
-            for i in $(seq 1 "$pings"); do
-              if timeout "${tout}s" curl --max-time "${tout}" --insecure -sS -o /dev/null -w "%{http_code}" "${proto}://${host}:${port}${path}" 2>/dev/null | awk '{exit ($1>=200 && $1<400)?0:1}'; then
-                succ_http=$((succ_http+1))
+            local host="$1"
+            local tests="$2"
+            local proto="$3"
+            local path="$4"
+            local timeout_sec="$5"
+            
+            local ping_success=0
+            local http_success=0
+            
+            # ICMP ping tests
+            for i in $(seq 1 "$tests"); do
+              if timeout 2 ping -c 1 -W 1 "$host" >/dev/null 2>&1; then
+                ping_success=$((ping_success + 1))
               fi
             done
-            http_ratio=$(awk -v s="$succ_http" -v t="$pings" 'BEGIN{printf("%.2f", (t>0)?s/t:0)}')
+            
+            # HTTP tests
+            for i in $(seq 1 "$tests"); do
+              local code
+              code=$(timeout "${timeout_sec}s" curl \
+                --max-time "${timeout_sec}" \
+                --insecure \
+                --silent \
+                --output /dev/null \
+                --write-out "%{http_code}" \
+                "${proto}://${host}${path}" 2>/dev/null) || code="000"
+              
+              if [ "$code" -ge 200 ] && [ "$code" -lt 500 ]; then
+                http_success=$((http_success + 1))
+              fi
+            done
+            
+            local ping_ratio=$(awk -v s="$ping_success" -v t="$tests" 'BEGIN{printf("%.2f", s/t)}')
+            local http_ratio=$(awk -v s="$http_success" -v t="$tests" 'BEGIN{printf("%.2f", s/t)}')
+            
             printf "%s,%s" "$ping_ratio" "$http_ratio"
           }
-
-          # --- create proxies list from the scanner log ---
-          # CRITICAL FIX 4.0: پارسر فقط IP را می خواند. پورت 443 فرض شده است.
-          PROXIES_FILE="${TMPDIR}/proxies.txt"
-          : > "$PROXIES_FILE"
           
-          echo "=> Parsing '$LOG' for live proxies (IP-only format, port 443 assumed)..."
+          echo "::endgroup::"
           
-          # 1. فقط IP را از خطوط LIVE استخراج کن
-          grep -i "LIVE" "$LOG" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | uniq | while read -r ip; do
-              # 2. لَتنسی را از همان خط پیدا کن
-              lat_line=$(grep -i "LIVE" "$LOG" | grep "$ip" | head -n1)
-              lat=$(echo "$lat_line" | grep -Eo '[0-9]+[[:space:]]*ms' | grep -Eo '[0-9]+' | head -n1)
-              [ -z "$lat" ] && lat=$(echo "$lat_line" | grep -Eo '[0-9]+' | head -n1) # اگر "ms" نبود، اولین عدد خط
-              [ -z "$lat" ] && lat=9999
+          # ====================================================================
+          # Main Testing Loop
+          # ====================================================================
+          
+          echo "::group::Testing discovered hosts"
+          
+          TOTAL_IPS=$(wc -l < "$DISC_FILE")
+          CURRENT=0
+          
+          while IFS= read -r ip; do
+            CURRENT=$((CURRENT + 1))
+            
+            # Progress indicator
+            if [ $((CURRENT % 10)) -eq 0 ] || [ "$CURRENT" -eq "$TOTAL_IPS" ]; then
+              echo "Progress: $CURRENT/$TOTAL_IPS hosts tested"
+            fi
+            
+            # Initialize metrics
+            IP_CLEAN=$(echo "$ip" | xargs)
+            SCANNER_LAT=9999
+            
+            # Geographic location
+            GEO_DATA=$(geoiplookup "$IP_CLEAN" 2>/dev/null || echo "")
+            GEO_CODE=$(echo "$GEO_DATA" | awk -F': ' '{print $2}' | cut -d',' -f1 | tr -d ' ')
+            [ -z "$GEO_CODE" ] && GEO_CODE="XX"
+            
+            # Real ICMP ping test
+            REAL_PING_MS=9999
+            if ping -c ${{ env.REAL_PING_TESTS }} -W 2 "$IP_CLEAN" > /tmp/ping_$$.log 2>&1; then
+              PING_AVG=$(awk -F'/' '/^rtt/ {print $5}' /tmp/ping_$$.log 2>/dev/null || echo "")
+              if [ -n "$PING_AVG" ]; then
+                REAL_PING_MS=$(printf "%.0f" "$PING_AVG" 2>/dev/null || echo 9999)
+              fi
+            fi
+            rm -f /tmp/ping_$$.log
+            
+            # TCP RTT test
+            TCP_RTT_MS=9999
+            if [ ${{ env.TCP_CONNECT_TESTS }} -gt 0 ]; then
+              TCP_RTT_MS=$(measure_tcp_rtt "$IP_CLEAN" "${{ env.TCP_TEST_PORT }}" "${{ env.TCP_CONNECT_TESTS }}")
+            fi
+            
+            # TLS handshake test
+            TLS_MS=9999
+            TLS_MS=$(measure_tls_handshake "$IP_CLEAN" "${{ env.TLS_TEST_PORT }}" "${{ env.TLS_TIMEOUT }}")
+            
+            # HTTP health check
+            HEALTH_RESULT=$(measure_health_check "https" "$IP_CLEAN" "${{ env.HEALTH_URL_PATH }}" "${{ env.HEALTH_HTTP_TIMEOUT }}")
+            HEALTH_OK=$(echo "$HEALTH_RESULT" | cut -d',' -f1)
+            HEALTH_MS=$(echo "$HEALTH_RESULT" | cut -d',' -f2)
+            HEALTH_CODE=$(echo "$HEALTH_RESULT" | cut -d',' -f3)
+            
+            # Throughput test (only if health check passed)
+            THROUGHPUT_BPS=0
+            if [ "$HEALTH_OK" -eq 1 ]; then
+              THROUGHPUT_RESULTS="${WORK_DIR}/throughput_${IP_CLEAN}.txt"
+              : > "$THROUGHPUT_RESULTS"
               
-              # 3. ذخیره در فرمت: "LATENCY IP"
-              echo "${lat} ${ip}" >> "$PROXIES_FILE"
-          done
+              for run in $(seq 1 ${{ env.THROUGHPUT_TEST_COUNT }}); do
+                bps=$(measure_throughput "https" "$IP_CLEAN" \
+                  "${{ env.THROUGHPUT_TEST_URL }}" \
+                  "${{ env.THROUGHPUT_TEST_BYTES }}" \
+                  "${{ env.THROUGHPUT_TIMEOUT }}")
+                echo "$bps" >> "$THROUGHPUT_RESULTS"
+              done
+              
+              # Calculate median throughput
+              THROUGHPUT_BPS=$(sort -n "$THROUGHPUT_RESULTS" | \
+                awk '{a[NR]=$1} END{
+                  if(NR==0) print 0
+                  else if(NR%2==1) print a[int(NR/2)+1]
+                  else print int((a[NR/2]+a[NR/2+1])/2)
+                }')
+            fi
+            
+            # Stability test
+            STABILITY_RESULT=$(measure_stability "$IP_CLEAN" 3 "https" \
+              "${{ env.HEALTH_URL_PATH }}" "${{ env.HEALTH_HTTP_TIMEOUT }}")
+            PING_STABILITY=$(echo "$STABILITY_RESULT" | cut -d',' -f1)
+            HTTP_STABILITY=$(echo "$STABILITY_RESULT" | cut -d',' -f2)
+            
+            # ================================================================
+            # Score Calculation
+            # ================================================================
+            
+            RAW_SCORE=$(awk \
+              -v w_lat="${{ env.W_SCANNER_LATENCY }}" -v lat="$SCANNER_LAT" \
+              -v w_ping="${{ env.W_REAL_PING }}" -v ping="$REAL_PING_MS" \
+              -v w_tcp="${{ env.W_TCP_RTT }}" -v tcp="$TCP_RTT_MS" \
+              -v w_thr="${{ env.W_THROUGHPUT }}" -v thr="$THROUGHPUT_BPS" \
+              -v w_tls="${{ env.W_TLS_HANDSHAKE }}" -v tls="$TLS_MS" \
+              -v w_health="${{ env.W_HEALTH }}" -v h_ok="$HEALTH_OK" -v h_ms="$HEALTH_MS" \
+              -v w_stab="${{ env.W_STABILITY }}" -v p_stab="$PING_STABILITY" -v h_stab="$HTTP_STABILITY" \
+              'BEGIN{
+                # Normalize latency metrics (lower is better)
+                s_lat = (lat < 9999 && lat > 0) ? 1000.0 / (lat + 1) : 0
+                s_ping = (ping < 9999 && ping > 0) ? 1000.0 / (ping + 1) : 0
+                s_tcp = (tcp < 9999 && tcp > 0) ? 1000.0 / (tcp + 1) : 0
+                s_tls = (tls < 9999 && tls > 0) ? 1000.0 / (tls + 1) : 0
+                s_health = (h_ok == 1) ? 1000.0 / (h_ms + 1) : 0
+                
+                # Normalize throughput (higher is better, convert to kbps)
+                s_thr = (thr > 0) ? thr / 1024.0 : 0
+                
+                # Normalize stability (0.0 to 1.0 range)
+                s_stab = (p_stab + h_stab) / 2.0
+                
+                # Calculate weighted score
+                score = (w_lat * s_lat) + (w_ping * s_ping) + (w_tcp * s_tcp) + \
+                        (w_thr * s_thr) + (w_tls * s_tls) + (w_health * s_health) + \
+                        (w_stab * s_stab)
+                
+                printf("%.6f", score)
+              }')
+            
+            # Geographic bonus
+            if echo "${{ env.PRIORITY_LOCATIONS }}" | grep -q "$GEO_CODE"; then
+              RAW_SCORE=$(awk -v s="$RAW_SCORE" -v b="${{ env.W_GEO_BONUS }}" 'BEGIN{printf("%.6f", s+b)}')
+            fi
+            
+            # Save metrics
+            echo "$RAW_SCORE $SCANNER_LAT $REAL_PING_MS $TCP_RTT_MS $THROUGHPUT_BPS $TLS_MS $HEALTH_OK $HEALTH_MS $HEALTH_CODE $PING_STABILITY $HTTP_STABILITY $GEO_CODE $IP_CLEAN" >> "$SCORES_FILE"
+            
+            # Save NDJSON metrics
+            jq -nc \
+              --arg ip "$IP_CLEAN" \
+              --arg geo "$GEO_CODE" \
+              --argjson scan_lat "$SCANNER_LAT" \
+              --argjson ping "$REAL_PING_MS" \
+              --argjson tcp "$TCP_RTT_MS" \
+              --argjson throughput "$THROUGHPUT_BPS" \
+              --argjson tls "$TLS_MS" \
+              --argjson h_ok "$HEALTH_OK" \
+              --argjson h_ms "$HEALTH_MS" \
+              --argjson h_code "$HEALTH_CODE" \
+              --argjson p_stab "$PING_STABILITY" \
+              --argjson h_stab "$HTTP_STABILITY" \
+              --argjson score "$RAW_SCORE" \
+              '{
+                ip: $ip,
+                geo: $geo,
+                scanner_latency_ms: $scan_lat,
+                ping_ms: $ping,
+                tcp_rtt_ms: $tcp,
+                throughput_bps: $throughput,
+                tls_handshake_ms: $tls,
+                health_check_ok: $h_ok,
+                health_latency_ms: $h_ms,
+                health_status_code: $h_code,
+                ping_stability: $p_stab,
+                http_stability: $h_stab,
+                score: $score
+              }' >> "$METRICS_FILE"
+            
+            if [ "${{ env.DEBUG }}" = "true" ]; then
+              echo "  → $IP_CLEAN: score=$RAW_SCORE, ping=${REAL_PING_MS}ms, throughput=${THROUGHPUT_BPS}bps"
+            fi
+            
+          done < "$DISC_FILE"
           
-          # حذف موارد تکراری
-          sort -u -o "$PROXIES_FILE" "$PROXIES_FILE"
+          echo "::endgroup::"
+          
+          # ====================================================================
+          # Generate Summary Report
+          # ====================================================================
+          
+          echo "::group::Generating summary report"
+          
+          OUT_DIR="${GITHUB_WORKSPACE}/scan_results"
+          mkdir -p "$OUT_DIR"
+          
+          # Copy full results
+          cp "$METRICS_FILE" "$OUT_DIR/" || true
+          cp "$SCORES_FILE" "$OUT_DIR/" || true
+          
+          # Generate top results summary
+          if [ -s "$METRICS_FILE" ]; then
+            jq -s "sort_by(-.score) | .[0:${{ env.MAX_RESULTS }}]" \
+              "$METRICS_FILE" > "$OUT_DIR/${{ env.SUMMARY_OUTPUT }}"
+            
+            echo "📊 Summary Report:"
+            echo "  Total hosts tested: $(wc -l < "$DISC_FILE")"
+            echo "  Results saved: $OUT_DIR/${{ env.SUMMARY_OUTPUT }}"
+            
+            # Display top 5 results
+            echo ""
+            echo "🏆 Top 5 Results:"
+            jq -r '.[] | "  \(.ip) - Score: \(.score | tonumber | floor) - Ping: \(.ping_ms)ms - Throughput: \(.throughput_bps/1024|floor)kbps"' \
+              "$OUT_DIR/${{ env.SUMMARY_OUTPUT }}" | head -5
+          fi
+          
+          echo "::endgroup::"
+          
+          echo "metrics_file=$OUT_DIR/${{ env.METRICS_OUTPUT }}" >> $GITHUB_OUTPUT
+          echo "summary_file=$OUT_DIR/${{ env.SUMMARY_OUTPUT }}" >> $GITHUB_OUTPUT
 
-          # اگر پراکسی پیدا نشد، با موفقیت خارج شو
-          if [ ! -s "$PROXIES_FILE" ]; then
-            echo "No LIVE proxies in 'IP' format were found in $LOG — exiting successfully."
-            # در ویدیوی قبلی شما، این باعث خروج با کد 1 شد. این `exit 0` تضمین می کند که موفقیت آمیز باشد.
+      # ========================================================================
+      # STEP 8: Save Best Proxy to Cloudflare D1
+      # ========================================================================
+      - name: Save best proxy to Cloudflare D1
+        if: steps.validate.outputs.d1_enabled == 'true' && steps.advanced.outputs.summary_file != ''
+        id: save_d1
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+        run: |
+          set -euo pipefail
+          
+          echo "::group::Saving best proxy to Cloudflare D1"
+          
+          SUMMARY_FILE="${{ steps.advanced.outputs.summary_file }}"
+          
+          if [ ! -f "$SUMMARY_FILE" ]; then
+            echo "::error::Summary file not found: $SUMMARY_FILE"
+            exit 1
+          fi
+          
+          # Extract the top-scoring proxy (the best one)
+          BEST_PROXY=$(jq -r '.[0]' "$SUMMARY_FILE")
+          
+          if [ "$BEST_PROXY" = "null" ] || [ -z "$BEST_PROXY" ]; then
+            echo "::warning::No valid proxy found in results"
             exit 0
           fi
           
-          echo "=> Found $(wc -l < "$PROXIES_FILE") unique live proxies. Starting advanced tests on port 443..."
-
-          # --- iterate proxies and run tests ---
-          # اصلاح حلقه: اکنون 2 متغیر (lat, ip) را می خواند
-          while read -r lat ip; do
-            # تخصیص متغیرهای IP و Port
-            IP_CLEAN="${ip}"
-            PORT_CLEAN="443" # <-- راه حل نهایی: استفاده از پورت 443 طبق عکس
+          # Extract individual fields
+          BEST_IP=$(echo "$BEST_PROXY" | jq -r '.ip')
+          BEST_SCORE=$(echo "$BEST_PROXY" | jq -r '.score')
+          BEST_GEO=$(echo "$BEST_PROXY" | jq -r '.geo')
+          BEST_PING=$(echo "$BEST_PROXY" | jq -r '.ping_ms')
+          BEST_THROUGHPUT=$(echo "$BEST_PROXY" | jq -r '.throughput_bps')
+          BEST_TLS=$(echo "$BEST_PROXY" | jq -r '.tls_handshake_ms')
+          BEST_HEALTH_OK=$(echo "$BEST_PROXY" | jq -r '.health_check_ok')
+          BEST_HEALTH_CODE=$(echo "$BEST_PROXY" | jq -r '.health_status_code')
+          PING_STAB=$(echo "$BEST_PROXY" | jq -r '.ping_stability')
+          HTTP_STAB=$(echo "$BEST_PROXY" | jq -r '.http_stability')
+          
+          # Get current timestamp in ISO 8601 format
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          
+          echo "🎯 Best Proxy Selected:"
+          echo "  IP: $BEST_IP"
+          echo "  Score: $BEST_SCORE"
+          echo "  Location: $BEST_GEO"
+          echo "  Ping: ${BEST_PING}ms"
+          echo "  Throughput: $(awk -v t="$BEST_THROUGHPUT" 'BEGIN{printf("%.2f", t/1024/1024)}') Mbps"
+          
+          # Prepare SQL INSERT statement
+          # Table structure for proxy_updates:
+          # CREATE TABLE proxy_updates (
+          #   id INTEGER PRIMARY KEY AUTOINCREMENT,
+          #   ip TEXT NOT NULL,
+          #   score REAL,
+          #   geo_code TEXT,
+          #   ping_ms INTEGER,
+          #   throughput_bps INTEGER,
+          #   tls_handshake_ms INTEGER,
+          #   health_ok INTEGER,
+          #   health_status_code INTEGER,
+          #   ping_stability REAL,
+          #   http_stability REAL,
+          #   discovered_at TEXT,
+          #   created_at TEXT DEFAULT CURRENT_TIMESTAMP
+          # );
+          
+          SQL_QUERY="INSERT INTO proxy_updates (ip, score, geo_code, ping_ms, throughput_bps, tls_handshake_ms, health_ok, health_status_code, ping_stability, http_stability, discovered_at) VALUES ('${BEST_IP}', ${BEST_SCORE}, '${BEST_GEO}', ${BEST_PING}, ${BEST_THROUGHPUT}, ${BEST_TLS}, ${BEST_HEALTH_OK}, ${BEST_HEALTH_CODE}, ${PING_STAB}, ${HTTP_STAB}, '${TIMESTAMP}');"
+          
+          # Create API request payload
+          API_PAYLOAD=$(jq -nc \
+            --arg sql "$SQL_QUERY" \
+            '{sql: $sql}')
+          
+          # Make API call to Cloudflare D1
+          echo "Sending data to Cloudflare D1..."
+          
+          API_RESPONSE=$(curl -s -X POST \
+            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/d1/database/${CLOUDFLARE_D1_DATABASE_ID}/query" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$API_PAYLOAD")
+          
+          # Check if the request was successful
+          SUCCESS=$(echo "$API_RESPONSE" | jq -r '.success')
+          
+          if [ "$SUCCESS" = "true" ]; then
+            echo "✅ Successfully saved best proxy to Cloudflare D1"
+            echo "saved_to_d1=true" >> $GITHUB_OUTPUT
+            echo "best_proxy_ip=$BEST_IP" >> $GITHUB_OUTPUT
             
-            LAT=${lat//[^0-9]/}; [ -z "$LAT" ] && LAT=9999
-            
-            [ -z "$IP_CLEAN" ] && continue
-            
-            GEO_RAW=$(geoiplookup "$IP_CLEAN" 2>/dev/null || echo "")
-            GEO=$(echo "$GEO_RAW" | awk -F': ' '{print $2}' | cut -d',' -f1 | tr -d ' ')
-            [ -z "$GEO" ] && GEO="XX"
-
-            # real ping (پینگ به پورت نیاز ندارد)
-            REAL_PING=9999
-            if ping -c ${REAL_PING_TESTS} -W 1 "$IP_CLEAN" >/tmp/pinglog 2>/dev/null; then
-              AVG=$(awk -F'/' '/rtt/ {print $5} END{if(NR==0) print ""}' /tmp/pinglog || echo "")
-              if [ -n "$AVG" ]; then REAL_PING=$(printf "%.0f" "$AVG" 2>/dev/null || echo 9999); fi
-            fi
-
-            # tcp rtt (استفاده از پورت 443)
-            TCP_RTT=9999
-            if [ "$TCP_TESTS" -gt 0 ]; then TCP_RTT=$(measure_tcp_rtt "$IP_CLEAN" "$PORT_CLEAN" "$TCP_TESTS" || echo 9999); fi
-
-            # TLS handshake (استفاده از پورت 443)
-            TLS_MS=9999
-            TLS_MS=$(measure_tls "$IP_CLEAN" "$PORT_CLEAN" "$TLS_TIMEOUT" || echo 9999)
-
-            # HTTP health & throughput (استفاده از پورت 443)
-            # پورت 443 یعنی پروتکل باید همیشه https باشد
-            HTTP_PROTO="https"
-            HEALTH_RES=$(measure_http_and_throughput "$HTTP_PROTO" "$IP_CLEAN" "$PORT_CLEAN" "$HEALTH_PATH" "$HEALTH_TIMEOUT" "$THROUGHPUT_BYTES" || echo "0,9999,0,000")
-            
-            HEALTH_OK=$(echo "$HEALTH_RES" | cut -d',' -f1)
-            HEALTH_LAT_MS=$(echo "$HEALTH_RES" | cut -d',' -f2)
-            THROUGHPUT_BPS=$(echo "$HEALTH_RES" | cut -d',' -f3)
-            HEALTH_STATUS_CODE=$(echo "$HEALTH_RES" | cut -d',' -f4)
-
-            # stability (استفاده از پورت 443)
-            STAB=$(measure_stability "$IP_CLEAN" "$PORT_CLEAN" 3 "$HTTP_PROTO" "$HEALTH_PATH" "$HEALTH_TIMEOUT" || echo "0,0")
-            PING_RATIO=$(echo "$STAB" | cut -d',' -f1)
-            HTTP_RATIO=$(echo "$STAB" | cut -d',' -f2)
-
-            # compute raw score using AWK (floating math)
-            RAW_SCORE=$(awk -v w_lat="$W_SCANNER_LATENCY" -v lat="$LAT" \
-                          -v w_rp="$W_REAL_PING" -v rp="$REAL_PING" \
-                          -v w_tcp="$W_TCP_RTT" -v tcp="$TCP_RTT" \
-                          -v w_thr="$W_THROUGHPUT" -v thr="$THROUGHPUT_BPS" \
-                          -v w_tls="$W_TLS_HANDSHAKE" -v tls="$TLS_MS" \
-                          -v w_health="$W_HEALTH" -v health_ok="$HEALTH_OK" -v health_lat="$HEALTH_LAT_MS" \
-                          -v w_stab="$W_STABILITY" -v ping_ratio="$PING_RATIO" -v http_ratio="$HTTP_RATIO" \
-                          'BEGIN{
-                             s_lat = (lat>0 ? 1000/(lat+1) : 0);
-                             s_rp  = (rp>0 ? 1000/(rp+1) : 0);
-                             s_tcp = (tcp<9999 && tcp>0 ? 1000/(tcp+1) : 0);
-                             s_thr = (thr>0 ? thr/1024.0 : 0);
-                             s_tls = (tls<9999 && tls>0 ? 1000/(tls+1) : 0);
-                             s_health = (health_ok==1 ? (1000/(health_lat+1)) : 0);
-                             s_stab = ( (ping_ratio + http_ratio) / 2.0 );
-                             raw = (w_lat*s_lat) + (w_rp*s_rp) + (w_tcp*s_tcp) + (w_thr*s_thr) + (w_tls*s_tls) + (w_health*s_health) + (w_stab*s_stab);
-                             printf("%.6f", raw);
-                          }')
-
-            # store raw metrics line (human readable)
-            echo "${RAW_SCORE} ${LAT} ${REAL_PING} ${TCP_RTT} ${THROUGHPUT_BPS} ${TLS_MS} ${HEALTH_OK} ${HEALTH_LAT_MS} ${HEALTH_STATUS_CODE} ${PING_RATIO} ${HTTP_RATIO} ${GEO} ${IP_CLEAN}:${PORT_CLEAN}" >> "$SCORE_RAW"
-
-            # append json ndjson line
-            # ذخیره در فرمت IP:PORT
-            jq -nc --arg ip_port "$IP_CLEAN:$PORT_CLEAN" --arg geo "$GEO" \
-              --argjson lat "$LAT" --argjson realping "$REAL_PING" --argjson tcp "$TCP_RTT" \
-              --argjson throughput "$THROUGHPUT_BPS" --argjson tls "$TLS_MS" \
-              --argjson health_ok "$HEALTH_OK" --argjson health_lat "$HEALTH_LAT_MS" \
-              --argjson health_status "$HEALTH_STATUS_CODE" --argjson ping_ratio "$PING_RATIO" --argjson http_ratio "$HTTP_RATIO" \
-              --argjson raw "$RAW_SCORE" \
-              '{ip_port:$ip_port,geo:$geo,latency:$lat,realping:$realping,tcp_rtt:$tcp,throughput_bps:$throughput,tls_ms:$tls,health_ok:$health_ok,health_latency_ms:$health_lat,health_status:$health_status,ping_ratio:$ping_ratio,http_ratio:$http_ratio,raw_score:$raw}' \
-              >> "$METRICS_FILE"
-
-            if [ "${DEBUG}" = "true" ]; then
-              echo "DEBUG: metrics for $IP_CLEAN:$PORT_CLEAN -> raw=$RAW_SCORE"
-            fi
-
-          done < "$PROXIES_FILE"
-
-          echo "Scanning completed. Raw scores and metrics saved to:"
-          echo " - $SCORE_RAW"
-          echo " - $METRICS_FILE"
-
-          # copy metrics to repository workspace so other steps can access (optional)
-          cp "$METRICS_FILE" "${GITHUB_WORKSPACE}/$(basename "$METRICS_FILE")" || true
-          cp "$SCORE_RAW" "${GITHUB_WORKSPACE}/$(basename "$SCORE_RAW")" || true
-
-          # Create a simple summary JSON (top 5 by raw score)
-          if command -v jq >/dev/null 2>&1 && [ -s "$METRICS_FILE" ]; then
-            jq -s 'sort_by(-.raw_score) | .[0:5]' "$METRICS_FILE" > "${GITHUB_WORKSPACE}/${SUMMARY}" || true
-            echo "Summary saved to ${SUMMARY}"
+            # Save response for debugging
+            echo "$API_RESPONSE" > "${GITHUB_WORKSPACE}/scan_results/d1_response.json"
+          else
+            ERROR_MSG=$(echo "$API_RESPONSE" | jq -r '.errors[0].message // "Unknown error"')
+            echo "::error::Failed to save to D1: $ERROR_MSG"
+            echo "API Response: $API_RESPONSE"
+            echo "saved_to_d1=false" >> $GITHUB_OUTPUT
           fi
+          
+          echo "::endgroup::"
 
-          # keep job successful
-          exit 0
+      # ========================================================================
+      # STEP 9: Upload Results as Artifacts
+      # ========================================================================
+      - name: Upload scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-results-${{ github.run_number }}
+          path: |
+            scan_results/
+          retention-days: 30
+          compression-level: 9
 
+      # ========================================================================
+      # STEP 10: Generate Job Summary
+      # ========================================================================
+      - name: Generate job summary
+        if: always()
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          # 🔍 Proxy Scanner Results
+          
+          ## Configuration
+          - **Targets**: ${{ env.TARGETS || 'None specified' }}
+          - **Scanners**: Masscan=${{ env.USE_MASSCAN }}, ZMap=${{ env.USE_ZMAP }}, RScanner=${{ env.USE_RSCANNER }}
+          - **Discovered IPs**: ${{ steps.discover.outputs.discovered_count || 0 }}
+          
+          ## Results
+          - **Metrics File**: `${{ steps.advanced.outputs.metrics_file || 'N/A' }}`
+          - **Summary File**: `${{ steps.advanced.outputs.summary_file || 'N/A' }}`
+          - **Saved to D1**: ${{ steps.save_d1.outputs.saved_to_d1 || 'false' }}
+          - **Best Proxy IP**: ${{ steps.save_d1.outputs.best_proxy_ip || 'N/A' }}
+          
+          ## Cloudflare D1 Integration
+          - **D1 Database ID**: `${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}`
+          - **Status**: ${{ steps.validate.outputs.d1_enabled == 'true' && '✅ Enabled' || '⚠️ Not configured' }}
+          
+          ## Next Steps
+          1. Download the artifacts from this workflow run
+          2. Review the summary JSON for top-scoring proxies
+          3. Check your Cloudflare D1 database `proxy_updates` table for the saved proxy
+          4. Query D1 to retrieve historical proxy data
+          
+          EOF
+
+  # ============================================================================
+  # Cleanup Job - Remove old workflow runs
+  # ============================================================================
   cleanup-runs:
-    name: Delete old workflow runs
+    name: Cleanup old workflow runs
     runs-on: ubuntu-latest
     needs: smartping
     if: always()
     permissions:
       actions: write
       contents: read
+    
     steps:
       - name: Delete old workflow runs
         uses: Mattraks/delete-workflow-runs@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           repository: ${{ github.repository }}
-          retain_days: 0
-          keep_minimum_runs: 0
+          retain_days: 7
+          keep_minimum_runs: 3
