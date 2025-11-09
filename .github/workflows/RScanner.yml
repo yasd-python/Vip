@@ -98,11 +98,10 @@ jobs:
           }
 
           echo "🔧 Building Masscan (make -j)..."
-          # ensure required includes
           export CFLAGS="-O2 -fPIC"
           make -j"$(nproc)" || {
-            echo "❌ masscan build failed; dumping last 200 lines of build log"
-            tail -n 200 build.log || true
+            echo "❌ masscan build failed; printing last 200 lines of output"
+            tail -n 200 Makefile || true
             exit 1
           }
 
@@ -147,14 +146,12 @@ jobs:
             exit 1
           }
 
-          # built binary may be under src/
           if [ -f src/zmap ]; then
             sudo cp -f src/zmap /usr/local/bin/zmap
             sudo chmod +x /usr/local/bin/zmap
             echo "✅ zmap installed to /usr/local/bin/zmap"
             /usr/local/bin/zmap --version || true
           else
-            # try looking for other locations
             FOUND=$(find . -type f -name zmap -perm -111 -print -quit || true)
             if [ -n "$FOUND" ]; then
               sudo cp -f "$FOUND" /usr/local/bin/zmap
@@ -287,7 +284,6 @@ jobs:
             exit 0
           fi
 
-          # (functions: retry_with_backoff, measure_tcp_rtt, measure_tls, measure_health, measure_single_throughput, measure_stability)
           retry_with_backoff() {
             local host="$1" port="$2"
             local max_retries=5 delay=1 retries=0
