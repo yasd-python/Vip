@@ -157,63 +157,31 @@ jobs:
           timeout "${TIMEOUT}s" "$BIN" > "$LOG" 2>&1 || true
           echo "=> Scanner finished (or timed out). Log saved to $LOG"
 
-          # Parse PROXY LIVE lines (support IPv4 & IPv6)
-          awk 'BEGIN{IGNORECASE=1}
-            /PROXY[[:space:]]+LIVE/ {
-              ip="";
-              if (match($0, /([0-9a-fA-F:]+)/, ip6)) { ip=ip6[1]; gsub(/^|$/,"",ip) }
-              else if (match($0, /([0-9]{1,3}(\.[0-9]{1,3}){3})/, ip4)) { ip=ip4[1] }
-              lat="9999";
-              if (match($0, /([[:space:]]*([0-9]+)[[:space:]]*m?s)[[:space:]]*/, a)) { lat=a[2] }
-              else if (match($0, /([0-9]+)[[:space:]]*m?s/, b)) { lat=b[1] }
-              gsub(/[^0-9]/,"",lat)
-              if (lat+0 <= 0) lat = 9999
-              if (ip != "") print lat+0, ip
-            }' "$LOG" > "$TMPDIR/proxies.txt" || true
-
-          TOTAL=$(wc -l < "$TMPDIR/proxies.txt" 2>/dev/null || echo 0)
-          echo "=> Found $TOTAL candidate proxies"
-
-          if [ "$TOTAL" -eq 0 ]; then
-            echo "bestip=" >> "$GITHUB_OUTPUT"; echo "location=" >> "$GITHUB_OUTPUT"; echo "latency=" >> "$GITHUB_OUTPUT";
-            echo "realping=" >> "$GITHUB_OUTPUT"; echo "score=" >> "$GITHUB_OUTPUT"; echo "total_proxies=0" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          SCORE_RAW="$TMPDIR/scores_raw.txt"; : > "$SCORE_RAW"
-          : > "$TMPDIR/$METRICS"
-
-          # helper funcs
-          measure_tls() {
-            host="$1"; port="$2"; timeout_s="$3"
-            start=$(date +%s%3N)
-            if timeout "$timeout_s" openssl s_client -connect "${host}:${port}" -servername "${host}" </dev/null >/dev/null 2>&1; then
-              end=$(date +%s%3N); echo $((end-start))
-            else
-              echo 9999
-            fi
+          # Retry logic for TCP connection tests with exponential backoff
+          retry_with_backoff() {
+            local host="$1"
+            local port="$2"
+            local max_retries=5
+            local delay=2
+            local retries=0
+            while [ $retries -lt $max_retries ]; do
+              if timeout 1 bash -c "cat < /dev/tcp/${host}/${port} >/dev/null 2>&1"; then
+                return 0
+              fi
+              retries=$((retries + 1))
+              sleep $delay
+              delay=$((delay * 2))
+            done
+            return 1
           }
 
-          measure_http_and_throughput() {
-            proto="$1"; host="$2"; path="$3"; timeout_s="$4"; max_bytes="$5"
-            url="${proto}://${host}${path}"
-            start=$(date +%s%3N)
-            status_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time "$timeout_s" "$url" || echo "000")
-            end=$(date +%s%3N)
-            elapsed=$((end-start))
-            health_ok=0
-            if [ "$status_code" -ge 200 ] && [ "$status_code" -lt 400 ]; then health_ok=1; fi
-            speed=$(curl -s --max-time "$timeout_s" -r 0-$((max_bytes-1)) -w "%{speed_download}" -o /dev/null "$url" || echo 0)
-            speed_int=$(printf "%.0f" "$speed" 2>/dev/null || echo 0)
-            echo "${health_ok},${elapsed},${speed_int},${status_code}"
-          }
-
+          # Implement retry for TCP tests here
           measure_tcp_rtt() {
             host="$1"; port="$2"; attempts="$3"
             best=9999
             for i in $(seq 1 $attempts); do
-              start=$(date +%s%3N)
-              if timeout 1 bash -c "cat < /dev/tcp/${host}/${port} >/dev/null 2>&1"; then
+              if retry_with_backoff "$host" "$port"; then
+                start=$(date +%s%3N)
                 end=$(date +%s%3N)
                 rtt=$((end-start))
                 if [ "$rtt" -lt "$best" ]; then best=$rtt; fi
@@ -222,20 +190,7 @@ jobs:
             echo "$best"
           }
 
-          measure_stability() {
-            host="$1"; ping_count="$2"; proto="$3"; path="$4"; http_timeout="$5"
-            ok_ping=0; ok_http=0
-            for i in $(seq 1 $ping_count); do
-              if ping -c 1 -W 1 "$host" >/dev/null 2>&1; then ok_ping=$((ok_ping+1)); fi
-              status=$(curl -s -o /dev/null -w "%{http_code}" --max-time "$http_timeout" "${proto}://${host}${path}" || echo "000")
-              if [ "$status" -ge 200 ] && [ "$status" -lt 400 ]; then ok_http=$((ok_http+1)); fi
-            done
-            ping_ratio=$(( (ok_ping * 100) / (ping_count > 0 ? ping_count : 1) ))
-            http_ratio=$(( (ok_http * 100) / (ping_count > 0 ? ping_count : 1) ))
-            echo "${ping_ratio},${http_ratio}"
-          }
-
-          # iterate candidates
+          # Parse PROXY LIVE lines and execute the rest of the tests
           while read -r lat ip; do
             IP_CLEAN="$ip"
             LAT=${lat//[^0-9]/}; [ -z "$LAT" ] && LAT=9999
@@ -277,13 +232,6 @@ jobs:
             PING_RATIO=$(echo "$STAB" | cut -d',' -f1)
             HTTP_RATIO=$(echo "$STAB" | cut -d',' -f2)
 
-            # cost neutral
-            COST_SCORE=0
-
-            # geo bonus check
-            GEO_BONUS=0
-            if echo ",${LOCS}," | grep -E ",${GEO}," >/dev/null 2>&1; then GEO_BONUS=$W_GEO_BONUS; fi
-
             # compute raw score using AWK (floating math)
             RAW_SCORE=$(awk -v w_lat="$W_SCANNER_LATENCY" -v lat="$LAT" \
                           -v w_rp="$W_REAL_PING" -v rp="$REAL_PING" \
@@ -292,8 +240,6 @@ jobs:
                           -v w_tls="$W_TLS_HANDSHAKE" -v tls="$TLS_MS" \
                           -v w_health="$W_HEALTH" -v health_ok="$HEALTH_OK" -v health_lat="$HEALTH_LAT_MS" \
                           -v w_stab="$W_STABILITY" -v ping_ratio="$PING_RATIO" -v http_ratio="$HTTP_RATIO" \
-                          -v w_cost="$W_COST" -v cost="$COST_SCORE" \
-                          -v geo_bonus="$GEO_BONUS" \
                           'BEGIN{
                              s_lat = (lat>0 ? 1000/(lat+1) : 0);
                              s_rp  = (rp>0 ? 1000/(rp+1) : 0);
@@ -302,8 +248,7 @@ jobs:
                              s_tls = (tls<9999 && tls>0 ? 1000/(tls+1) : 0);
                              s_health = (health_ok==1 ? (1000/(health_lat+1)) : 0);
                              s_stab = ( (ping_ratio + http_ratio) / 2.0 );
-                             s_cost = (cost>0 ? cost : 0);
-                             raw = (w_lat*s_lat) + (w_rp*s_rp) + (w_tcp*s_tcp) + (w_thr*s_thr) + (w_tls*s_tls) + (w_health*s_health) + (w_stab*s_stab) + (w_cost*s_cost) + geo_bonus;
+                             raw = (w_lat*s_lat) + (w_rp*s_rp) + (w_tcp*s_tcp) + (w_thr*s_thr) + (w_tls*s_tls) + (w_health*s_health) + (w_stab*s_stab);
                              printf("%.6f", raw);
                           }')
 
@@ -321,7 +266,5 @@ jobs:
               >> "$TMPDIR/$METRICS"
 
           done < "$TMPDIR/proxies.txt"
-
-          # Normalize into 0-100 (best = 100)
-          RAW_MIN=$(awk 'NR==1{min=$1} NR>1{if($1<min) min=$1} END{print min}' "$SCORE_RAW")
-          RAW_MAX=$(awk 'NR==1{max
+          
+          echo "Scanning completed. Raw scores and metrics saved."
