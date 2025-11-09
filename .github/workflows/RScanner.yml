@@ -421,7 +421,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          SUMMARY_FILE="${{ github.workspace }}/${{ env.SUMMARY_OUTPUT }}"
+          SUMMARY_FILE="${GITHUB_WORKSPACE}/${{ env.SUMMARY_OUTPUT }}"
 
           if [ ! -s "$SUMMARY_FILE" ]; then
             echo "No summary file found — skipping D1 insert."
@@ -441,27 +441,49 @@ jobs:
 
           echo "🌐 Best IP found: $BEST_IP (Score: $BEST_SCORE)"
 
-          # create SQL file for insert (values quoted appropriately)
-          cat > insert_best_ip.sql <<SQL
-INSERT INTO proxy_updates (ip, score, geo, latency, throughput, updated_at)
-VALUES ('$BEST_IP', '$BEST_SCORE', '$BEST_GEO', $BEST_PING, $BEST_THR, CURRENT_TIMESTAMP);
-SQL
+          # Create properly escaped SQL file for insert
+          # Use printf to properly escape single quotes in values
+          ESCAPED_IP=$(echo "$BEST_IP" | sed "s/'/''/g")
+          ESCAPED_GEO=$(echo "$BEST_GEO" | sed "s/'/''/g")
+
+          cat > insert_best_ip.sql <<EOF
+          INSERT INTO proxy_updates (ip, score, geo, latency, throughput, updated_at)
+          VALUES ('${ESCAPED_IP}', ${BEST_SCORE}, '${ESCAPED_GEO}', ${BEST_PING}, ${BEST_THR}, CURRENT_TIMESTAMP);
+          EOF
+
+          echo "Generated SQL:"
+          cat insert_best_ip.sql
 
           # install wrangler (if not present) and execute SQL against D1
           if ! command -v wrangler &>/dev/null; then
             echo "Installing wrangler..."
-            npm install -g wrangler@3 || true
+            npm install -g wrangler@3 || {
+              echo "Failed to install wrangler globally, trying local install..."
+              npm install wrangler@3
+              export PATH="$PATH:$(pwd)/node_modules/.bin"
+            }
           fi
 
-          # Export token for wrangler to use (wrangler supports CF_API_TOKEN env)
+          # Verify wrangler is available
+          if ! command -v wrangler &>/dev/null; then
+            echo "ERROR: wrangler installation failed. Cannot proceed with D1 insert."
+            exit 1
+          fi
+
+          # Export token for wrangler to use
           export CF_API_TOKEN="${CF_API_TOKEN}"
 
           echo "Executing SQL against D1 database: ${D1_DB_NAME} (account: ${CF_ACCOUNT_ID})"
-          # run the SQL file; wrap in || to avoid failing the whole workflow if insert fails, but still log error
-          if wrangler d1 execute "${D1_DB_NAME}" --account-id="${CF_ACCOUNT_ID}" --file=insert_best_ip.sql; then
+          
+          # Execute with proper error handling
+          if wrangler d1 execute "${D1_DB_NAME}" \
+            --account-id="${CF_ACCOUNT_ID}" \
+            --file=insert_best_ip.sql 2>&1 | tee d1_output.log; then
             echo "✅ Best IP inserted into D1 successfully."
           else
-            echo "⚠️ D1 insert failed (see output)."
+            echo "⚠️ D1 insert failed. Check the output above for details."
+            cat d1_output.log || true
+            exit 1
           fi
 
       - name: Upload scan artifacts
@@ -470,8 +492,9 @@ SQL
         with:
           name: scan_results
           path: |
-            scan_results
-            scan_results/*
+            scan_results/
+            *.log
+            *.sql
 
   cleanup-runs:
     name: Delete old workflow runs
