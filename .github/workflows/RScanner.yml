@@ -27,7 +27,7 @@ env:
 
   # TCP test
   TCP_CONNECT_TESTS: "1"
-  # TCP_TEST_PORT و TLS_TEST_PORT دیگر استفاده نمی‌شوند چون پورت پویا است
+  # پورت‌ها دیگر از env خوانده نمی‌شوند، پورت 443 به صورت ثابت استفاده خواهد شد
 
   # HTTP / throughput / TLS
   HEALTH_URL_PATH: "/favicon.ico"
@@ -159,8 +159,7 @@ jobs:
           timeout "${TIMEOUT}s" "$BIN" > "$LOG" 2>&1 || true
           echo "=> Scanner finished (or timed out). Log saved to $LOG"
 
-          # --- helper functions ---
-          # این توابع همگی اصلاح شده‌اند تا پورت پویا را بپذیرند
+          # --- helper functions (آماده برای دریافت پورت پویا) ---
 
           retry_with_backoff() {
             local host="$1"
@@ -247,29 +246,22 @@ jobs:
           }
 
           # --- create proxies list from the scanner log ---
-          # CRITICAL FIX 3.0: پارسر جدید برای خواندن فرمت (IP PORT) با فاصله
+          # CRITICAL FIX 4.0: پارسر فقط IP را می خواند. پورت 443 فرض شده است.
           PROXIES_FILE="${TMPDIR}/proxies.txt"
           : > "$PROXIES_FILE"
           
-          echo "=> Parsing '$LOG' for live proxies (IP PORT space-separated format)..."
+          echo "=> Parsing '$LOG' for live proxies (IP-only format, port 443 assumed)..."
           
-          grep -i "LIVE" "$LOG" | while read -r line; do
-              # 1. پیدا کردن آدرس IP
-              ip=$(echo "$line" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1)
-              [ -z "$ip" ] && continue
-
-              # 2. پیدا کردن پورت (اولین عددی که بلافاصله بعد از IP می‌آید)
-              # از Perl-regex برای پیدا کردن IP و فاصله و سپس عدد پورت استفاده می‌کنیم
-              port=$(echo "$line" | grep -oP "${ip}[[:space:]]+\K([0-9]{1,5})" | head -n1)
-              [ -z "$port" ] && continue
+          # 1. فقط IP را از خطوط LIVE استخراج کن
+          grep -i "LIVE" "$LOG" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | uniq | while read -r ip; do
+              # 2. لَتنسی را از همان خط پیدا کن
+              lat_line=$(grep -i "LIVE" "$LOG" | grep "$ip" | head -n1)
+              lat=$(echo "$lat_line" | grep -Eo '[0-9]+[[:space:]]*ms' | grep -Eo '[0-9]+' | head -n1)
+              [ -z "$lat" ] && lat=$(echo "$lat_line" | grep -Eo '[0-9]+' | head -n1) # اگر "ms" نبود، اولین عدد خط
+              [ -z "$lat" ] && lat=9999
               
-              # 3. پیدا کردن لَتنسی (عددی که قبل از "ms" آمده یا آخرین عدد خط)
-              lat=$(echo "$line" | grep -Eo '[0-9]+[[:space:]]*ms' | grep -Eo '[0-9]+' | head -n1)
-              [ -z "$lat" ] && lat=$(echo "$line" | grep -Eo '[0-9]+' | tail -n1) # اگر "ms" نبود، آخرین عدد
-              [ -z "$lat" ] && lat=9999 # دیفالت
-              
-              # 4. ذخیره در فرمت: "LATENCY IP PORT"
-              echo "${lat} ${ip} ${port}" >> "$PROXIES_FILE"
+              # 3. ذخیره در فرمت: "LATENCY IP"
+              echo "${lat} ${ip}" >> "$PROXIES_FILE"
           done
           
           # حذف موارد تکراری
@@ -277,23 +269,23 @@ jobs:
 
           # اگر پراکسی پیدا نشد، با موفقیت خارج شو
           if [ ! -s "$PROXIES_FILE" ]; then
-            echo "No LIVE proxies in 'IP PORT' format were found in $LOG — exiting successfully."
+            echo "No LIVE proxies in 'IP' format were found in $LOG — exiting successfully."
+            # در ویدیوی قبلی شما، این باعث خروج با کد 1 شد. این `exit 0` تضمین می کند که موفقیت آمیز باشد.
             exit 0
           fi
           
-          echo "=> Found $(wc -l < "$PROXIES_FILE") unique live proxies. Starting advanced tests..."
+          echo "=> Found $(wc -l < "$PROXIES_FILE") unique live proxies. Starting advanced tests on port 443..."
 
           # --- iterate proxies and run tests ---
-          # اصلاح حلقه: اکنون 3 متغیر (lat, ip, port) را می‌خواند
-          while read -r lat ip port; do
+          # اصلاح حلقه: اکنون 2 متغیر (lat, ip) را می خواند
+          while read -r lat ip; do
             # تخصیص متغیرهای IP و Port
             IP_CLEAN="${ip}"
-            PORT_CLEAN="${port}"
+            PORT_CLEAN="443" # <-- راه حل نهایی: استفاده از پورت 443 طبق عکس
             
             LAT=${lat//[^0-9]/}; [ -z "$LAT" ] && LAT=9999
             
             [ -z "$IP_CLEAN" ] && continue
-            [ -z "$PORT_CLEAN" ] && continue
             
             GEO_RAW=$(geoiplookup "$IP_CLEAN" 2>/dev/null || echo "")
             GEO=$(echo "$GEO_RAW" | awk -F': ' '{print $2}' | cut -d',' -f1 | tr -d ' ')
@@ -306,28 +298,25 @@ jobs:
               if [ -n "$AVG" ]; then REAL_PING=$(printf "%.0f" "$AVG" 2>/dev/null || echo 9999); fi
             fi
 
-            # tcp rtt (استفاده از پورت پویا)
+            # tcp rtt (استفاده از پورت 443)
             TCP_RTT=9999
             if [ "$TCP_TESTS" -gt 0 ]; then TCP_RTT=$(measure_tcp_rtt "$IP_CLEAN" "$PORT_CLEAN" "$TCP_TESTS" || echo 9999); fi
 
-            # TLS handshake (استفاده از پورت پویا)
+            # TLS handshake (استفاده از پورت 443)
             TLS_MS=9999
             TLS_MS=$(measure_tls "$IP_CLEAN" "$PORT_CLEAN" "$TLS_TIMEOUT" || echo 9999)
 
-            # HTTP health & throughput (استفاده از پورت پویا)
+            # HTTP health & throughput (استفاده از پورت 443)
+            # پورت 443 یعنی پروتکل باید همیشه https باشد
             HTTP_PROTO="https"
             HEALTH_RES=$(measure_http_and_throughput "$HTTP_PROTO" "$IP_CLEAN" "$PORT_CLEAN" "$HEALTH_PATH" "$HEALTH_TIMEOUT" "$THROUGHPUT_BYTES" || echo "0,9999,0,000")
-            HEALTH_OK=$(echo "$HEALTH_RES" | cut -d',' -f1)
-            if [ "$HEALTH_OK" -eq 0 ]; then
-              HTTP_PROTO="http"
-              HEALTH_RES=$(measure_http_and_throughput "$HTTP_PROTO" "$IP_CLEAN" "$PORT_CLEAN" "$HEALTH_PATH" "$HEALTH_TIMEOUT" "$THROUGHPUT_BYTES" || echo "0,9999,0,000")
-            fi
+            
             HEALTH_OK=$(echo "$HEALTH_RES" | cut -d',' -f1)
             HEALTH_LAT_MS=$(echo "$HEALTH_RES" | cut -d',' -f2)
             THROUGHPUT_BPS=$(echo "$HEALTH_RES" | cut -d',' -f3)
             HEALTH_STATUS_CODE=$(echo "$HEALTH_RES" | cut -d',' -f4)
 
-            # stability (استفاده از پورت پویا)
+            # stability (استفاده از پورت 443)
             STAB=$(measure_stability "$IP_CLEAN" "$PORT_CLEAN" 3 "$HTTP_PROTO" "$HEALTH_PATH" "$HEALTH_TIMEOUT" || echo "0,0")
             PING_RATIO=$(echo "$STAB" | cut -d',' -f1)
             HTTP_RATIO=$(echo "$STAB" | cut -d',' -f2)
