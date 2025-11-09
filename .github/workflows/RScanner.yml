@@ -1,4 +1,4 @@
-name: Rust Proxy Scanner - Multi-Location KV Update (Enhanced V2)
+name: Rust Proxy Scanner - SmartPing Adaptive AI Edition
 
 on:
   workflow_dispatch:
@@ -6,414 +6,184 @@ on:
     - cron: '0 */6 * * *' # Runs every 6 hours
 
 concurrency:
-  group: rust-proxy-scan-multi-location
+  group: rust-proxy-smartping
   cancel-in-progress: true
 
 permissions:
   contents: read
-  actions: write # Required for cleaning up old runs
+  actions: write
 
 env:
-  CARGO_TERM_COLOR: always
-  CACHE_FILE: .cachelastbestip.txt
-  RUST_CACHE_KEY: v4
-  CF_ENVIRONMENT: production
   SCAN_BINARY: ./target/release/RScanner
   SCAN_LOG: scan.log
-  MAX_CF_RETRIES: "5"
-  CF_RETRY_BASE_SLEEP: "2"
   SCANNER_TIMEOUT: "600"
-  # Priority locations list - rotates through these
   PRIORITY_LOCATIONS: "US,DE,GB,NL,FR,SG,JP,CA,AU,CH"
+  REAL_PING_TESTS: "3" # Number of actual ping tests per IP
 
 jobs:
-  update-proxy-variable:
-    name: Build → Scan → Select Best Proxy by Location → Update CF KV
+  smartping:
+    name: Build → Scan → Real Network Test → Adaptive D1 Update
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 50
 
     steps:
-      - name: Checkout repository (full)
+      - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Install and verify system dependencies (Smart GeoIP Install)
+      - name: Install dependencies
         run: |
-          set -euo pipefail
-          echo "=> Updating package lists..."
           sudo apt-get update -y
+          sudo apt-get install -y jq curl geoip-bin build-essential pkg-config libssl-dev ca-certificates coreutils iputils-ping
 
-          echo "=> Installing core dependencies (excluding geoip-bin for now)..."
-          # Install all packages except geoip-bin
-          sudo apt-get install -y \
-            jq \
-            curl \
-            netcat-openbsd \
-            build-essential \
-            pkg-config \
-            libssl-dev \
-            ca-certificates \
-            coreutils
-          
-          echo "=> Checking for 'geoiplookup'..."
-          # Check if the geoiplookup command already exists
-          if ! command -v geoiplookup &> /dev/null; then
-            echo "   'geoiplookup' not found. Installing 'geoip-bin'..."
-            # If it doesn't exist, install it
-            sudo apt-get install -y geoip-bin
-            echo "   ✅ 'geoip-bin' installed."
-          else
-            # If it exists, skip installation
-            echo "   ✅ 'geoiplookup' is already installed. Skipping."
-          fi
-
-          echo "=> Cleaning up apt cache..."
-          sudo apt-get clean
-          
-          echo "=> Final verification of 'geoiplookup' command..."
-          # Final check to ensure the command is available
-          if ! command -v geoiplookup &> /dev/null; then
-            echo "❌ FATAL: 'geoiplookup' command is still not found!"
-            exit 1
-          fi
-          echo "✅ System dependencies installed and verified successfully"
-
-      - name: Restore Best IP Cache
-        uses: actions/cache@v4
-        id: ip-cache
-        with:
-          path: ${{ env.CACHE_FILE }}
-          key: rust-proxy-scanner-best-ip-cache-${{ env.RUST_CACHE_KEY }}-${{ runner.os }}
-          restore-keys: |
-            rust-proxy-scanner-best-ip-cache-${{ env.RUST_CACHE_KEY }}-
-            rust-proxy-scanner-best-ip-cache-
-
-      - name: Install Rust toolchain (stable)
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
 
-      - name: Cache Rust artifacts and registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            target
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: rust-cache-${{ env.RUST_CACHE_KEY }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            rust-cache-${{ env.RUST_CACHE_KEY }}-${{ runner.os }}-
+      - name: Build Rust scanner
+        run: cargo build --release
 
-      - name: Build Rust project (release)
-        run: |
-          set -euo pipefail
-          echo "=> Starting cargo build --release"
-          if ! cargo build --release 2>&1 | tee build-output.log; then
-            echo "❌ Cargo build failed. Showing last 200 lines:"
-            tail -n 200 build-output.log || true
-            exit 1
-          fi
-          echo "✅ Cargo build completed successfully"
-          ls -lah target/release/ || true
-          if [ -f "${{ env.SCAN_BINARY }}" ]; then
-            echo "✅ Scanner binary exists: ${{ env.SCAN_BINARY }}"
-          else
-            echo "❌ ERROR: Scanner binary not found at ${{ env.SCAN_BINARY }}"
-            exit 1
-          fi
-
-      - name: Run scanner and select best IP by *accurate* rotating location
-        id: scan
-        timeout-minutes: 15
-        run: |
-          set -euo pipefail
-          echo "=== Multi-Location Scanner execution started ==="
-          BIN="${{ env.SCAN_BINARY }}"
-          LOG="${{ env.SCAN_LOG }}"
-          CACHE_FILE="${{ env.CACHE_FILE }}"
-          TIMEOUT="${{ env.SCANNER_TIMEOUT }}"
-          PRIORITY_LOCATIONS="${{ env.PRIORITY_LOCATIONS }}"
-
-          # Create temporary directory and auto-cleanup
-          TMPDIR=$(mktemp -d)
-          ALL_PROXIES="$TMPDIR/all_proxies.txt"
-          LOCATION_PROXIES="$TMPDIR/location_proxies.txt"
-          SCAN_OUT="$TMPDIR/scan_out.log"
-          cleanup() {
-            rm -rf "$TMPDIR" || true
-          }
-          trap cleanup EXIT
-
-          # Initialize log files
-          : > "$LOG"
-          : > "$SCAN_OUT"
-          
-          if [ ! -f "$BIN" ]; then
-            echo "❌ FATAL: Scanner binary not found at $BIN"
-            exit 1
-          fi
-          chmod +x "$BIN"
-
-          # Run scanner with timeout management
-          set +e
-          echo "=> Running scanner (timeout ${TIMEOUT}s)..."
-          timeout "${TIMEOUT}s" "$BIN" > "$SCAN_OUT" 2>&1
-          SCANNER_EXIT_CODE=$?
-          set -e
-
-          if [ "$SCANNER_EXIT_CODE" -eq 0 ]; then
-            echo "✅ Scanner completed successfully"
-          elif [ "$SCANNER_EXIT_CODE" -eq 124 ]; then
-            echo "⚠️ Scanner timed out after ${TIMEOUT}s (continuing with partial results)"
-          else
-            echo "⚠️ Scanner exited with code ${SCANNER_EXIT_CODE} (continuing with partial results)"
-          fi
-
-          cp "$SCAN_OUT" "$LOG" || true
-
-          # Parsing scanner output for live proxies...
-          echo "=> Parsing scanner output for live proxies..."
-          awk 'BEGIN{IGNORECASE=1}
-            /PROXY[[:space:]]+LIVE/ {
-              # Extract latency
-              if (match($0, /\(([[:space:]]*([0-9]+)[[:space:]]*m?s)[[:space:]]*\)/, a)) {
-                lat = a[2];
-                gsub(/[^0-9]/,"",lat);
-              } else next;
-              
-              # Extract IPv4
-              if (match($0, /([0-9]{1,3}(\.[0-9]{1,3}){3})/, ip)) {
-                split(ip[1], oct, ".")
-                valid = 1
-                for (i in oct) {
-                  if (oct[i] < 0 || oct[i] > 255) valid = 0
-                }
-                if (valid && lat+0 > 0) {
-                  print lat+0, ip[1]
-                }
-              }
-            }' "$SCAN_OUT" > "$ALL_PROXIES" || true
-
-          TOTAL_PROXIES=$(wc -l < "$ALL_PROXIES" 2>/dev/null || echo 0)
-          echo "=> Found ${TOTAL_PROXIES} valid live proxies total"
-
-          if [ "$TOTAL_PROXIES" -eq 0 ]; then
-            echo "⚠️ No live proxies found in scan"
-            
-            # Try to use cached IP
-            if [ -f "${CACHE_FILE}" ]; then
-              CACHED_IP=$(tr -d ' \r\n\t' < "${CACHE_FILE}" 2>/dev/null || true)
-              if [[ "$CACHED_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
-                echo "✅ Using cached IP: $CACHED_IP"
-                echo "bestip=$CACHED_IP" >> "$GITHUB_OUTPUT"
-                echo "location=CACHED" >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
-            fi
-            
-            echo "❌ FATAL: No valid IP available (scan failed and cache is empty/invalid)"
-            exit 1
-          fi
-
-          # Determine target location using rotation
-          RUN_NUMBER=${{ github.run_number }}
-          IFS=',' read -ra LOCATIONS <<< "$PRIORITY_LOCATIONS"
-          LOCATION_COUNT=${#LOCATIONS[@]}
-          TARGET_INDEX=$((RUN_NUMBER % LOCATION_COUNT))
-          TARGET_LOCATION="${LOCATIONS[$TARGET_INDEX]}"
-          
-          echo "🌍 Target location for this run: $TARGET_LOCATION (run #$RUN_NUMBER)"
-
-          # Filtering proxies by *accurate* location
-          echo "=> Filtering proxies for location: $TARGET_LOCATION using precise GeoIP"
-          
-          : > "$LOCATION_PROXIES"
-          
-          while read -r latency ip; do
-            # *** Key improvement: Using 'geoiplookup' for accurate country detection ***
-            IP_COUNTRY_CODE=$(geoiplookup "$ip" 2>/dev/null | awk -F': ' '/GeoIP Country Edition:/ {print $2}' | cut -d',' -f1 | tr -d ' ' || echo "XX")
-            
-            # Check if the detected country code matches the target location
-            if [ "$IP_COUNTRY_CODE" = "$TARGET_LOCATION" ]; then
-              echo "$latency $ip" >> "$LOCATION_PROXIES"
-            fi
-          done < "$ALL_PROXIES"
-
-          LOCATION_COUNT=$(wc -l < "$LOCATION_PROXIES" 2>/dev/null || echo 0)
-          echo "=> Found ${LOCATION_COUNT} proxies matching location $TARGET_LOCATION"
-
-          # If no proxy is found for the target location, use the *global* best
-          if [ "$LOCATION_COUNT" -eq 0 ]; then
-            echo "⚠️ No proxies found for $TARGET_LOCATION, falling back to global best"
-            cp "$ALL_PROXIES" "$LOCATION_PROXIES"
-            TARGET_LOCATION="GLOBAL_FALLBACK"
-          fi
-
-          # Sort by lowest latency and select THE FASTEST one
-          sort -n -k1,1 "$LOCATION_PROXIES" > "$TMPDIR/sorted_proxies.txt"
-          
-          BEST_LINE=$(head -n 1 "$TMPDIR/sorted_proxies.txt")
-          BEST_LATENCY=$(echo "$BEST_LINE" | awk '{print $1}')
-          BEST_IP=$(echo "$BEST_LINE" | awk '{print $2}')
-
-          echo "🚀 SELECTED FASTEST PROXY:"
-          echo "   IP: $BEST_IP"
-          echo "   Latency: ${BEST_LATENCY}ms"
-          echo "   Location: $TARGET_LOCATION"
-
-          # Save to cache for subsequent runs
-          echo -n "${BEST_IP}" > "${CACHE_FILE}"
-          
-          # Output for subsequent steps
-          echo "bestip=${BEST_IP}" >> "$GITHUB_OUTPUT"
-          echo "location=${TARGET_LOCATION}" >> "$GITHUB_OUTPUT"
-          echo "latency=${BEST_LATENCY}" >> "$GITHUB_OUTPUT"
-          
-          echo "✅ Scanner step completed successfully"
-
-      - name: Upload scan.log for debugging
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: scan-log-${{ github.run_id }}
-          path: ${{ env.SCAN_LOG }}
-          retention-days: 7
-          if-no-files-found: warn
-
-      - name: Update Cloudflare KV with location metadata
-        id: update-kv
+      - name: Learn adaptive regions from D1
+        id: learn
         env:
-          CF_VAR_VALUE: ${{ steps.scan.outputs.bestip }}
-          CF_LOCATION: ${{ steps.scan.outputs.location }}
-          CF_LATENCY: ${{ steps.scan.outputs.latency }}
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-          CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
-          CF_VAR_KEY: ${{ secrets.CF_VAR_KEY }}
+          CF_DATABASE_ID: ${{ secrets.CF_DATABASE_ID }}
+        run: |
+          API="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/d1/database/${CF_DATABASE_ID}/query"
+          AUTH="Authorization: Bearer ${CF_API_TOKEN}"
+
+          echo "🧠 Fetching historical performance data..."
+          RESULT=$(curl -s -X POST -H "${AUTH}" -H "Content-Type: application/json" \
+            --data '{"sql":"SELECT location, AVG(score) AS avg_score FROM proxy_history GROUP BY location;"}' "$API")
+
+          LOCS=$(echo "$RESULT" | jq -r '.result[0].results[] | "\(.location):\(.avg_score)"' || true)
+          TOP=$(echo "$LOCS" | sort -t':' -k2 -nr | head -n5 | cut -d':' -f1 | tr '\n' ',' | sed 's/,$//')
+          [ -z "$TOP" ] && TOP="${{ env.PRIORITY_LOCATIONS }}"
+          echo "adaptive_locs=$TOP" >> "$GITHUB_OUTPUT"
+          echo "Adaptive learning prioritized: $TOP"
+
+      - name: Run Rust proxy scanner
+        id: scan
+        env:
+          ADAPTIVE_LOCS: ${{ steps.learn.outputs.adaptive_locs }}
         run: |
           set -euo pipefail
-          echo "=== Cloudflare KV update with metadata started ==="
-          
-          # Verify all required variables are present
-          for var in CF_API_TOKEN CF_ACCOUNT_ID CF_KV_NAMESPACE_ID CF_VAR_KEY CF_VAR_VALUE; do
-            if [ -z "${!var}" ]; then
-              echo "❌ ERROR: $var is not set"
-              exit 1
-            fi
-          done
-          echo "✅ Required env vars present"
+          BIN="${{ env.SCAN_BINARY }}"
+          LOG="${{ env.SCAN_LOG }}"
+          TMPDIR=$(mktemp -d)
+          LOCS="${ADAPTIVE_LOCS:-${{ env.PRIORITY_LOCATIONS }}}"
 
-          API_BASE="https://api.cloudflare.com/client/v4"
-          NAMESPACE_ID="${CF_KV_NAMESPACE_ID}"
-          ACCOUNT_ID="${CF_ACCOUNT_ID}"
-          KEY="${CF_VAR_KEY}"
-          VALUE="${CF_VAR_VALUE}"
-          LOCATION="${CF_LOCATION:-UNKNOWN}" # Add default value
-          LATENCY="${CF_LATENCY:-0}"       # Add default value
-          AUTH_HEADER="Authorization: Bearer ${CF_API_TOKEN}"
-          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          echo "🌍 Adaptive scanning order: $LOCS"
+          timeout "${{ env.SCANNER_TIMEOUT }}" "$BIN" > "$LOG" 2>&1 || true
 
-          # Verify namespace exists
-          echo "=> Verifying KV namespace..."
-          ns_list=$(curl -sSf -H "${AUTH_HEADER}" "${API_BASE}/accounts/${ACCOUNT_ID}/storage/kv/namespaces") || {
-            echo "❌ Failed to list KV namespaces"
-            exit 1
-          }
-          
-          if ! echo "$ns_list" | jq -e --arg nsid "$NAMESPACE_ID" '.result[] | select(.id==$nsid)' >/dev/null 2>&1; then
-            echo "❌ ERROR: Namespace ID ${NAMESPACE_ID} not found"
-            exit 1
-          fi
-          echo "✅ Namespace verified"
+          awk 'BEGIN{IGNORECASE=1}/PROXY[[:space:]]+LIVE/{
+            if (match($0,/([0-9]{1,3}(\.[0-9]{1,3}){3})/,ip) && match($0,/\(([0-9]+)ms\)/,lat))
+              print lat[1], ip[1]
+          }' "$LOG" > "$TMPDIR/proxies.txt"
 
-          # PUT primary key (just the IP) with retry logic
-          put_url="${API_BASE}/accounts/${ACCOUNT_ID}/storage/kv/namespaces/${NAMESPACE_ID}/values/${KEY}"
-          attempt=0
-          max_attempts=${MAX_CF_RETRIES:-5}
-          sleep_base=${CF_RETRY_BASE_SLEEP:-2}
+          TOTAL=$(wc -l < "$TMPDIR/proxies.txt" || echo 0)
+          echo "Found $TOTAL valid proxies."
 
-          echo "=> Storing proxy IP: ${VALUE}"
-
-          while [ $attempt -lt $max_attempts ]; do
-            attempt=$((attempt+1))
-            echo "=> PUT attempt $attempt/$max_attempts..."
-            
-            http_status=$(curl -s -o /tmp/cf_put_resp -w "%{http_code}" -X PUT \
-              -H "${AUTH_HEADER}" \
-              -H "Content-Type: text/plain" \
-              --data-binary "${VALUE}" \
-              "${put_url}" || echo "000")
-
-            if [ "$http_status" = "200" ] || [ "$http_status" = "201" ] || [ "$http_status" = "204" ]; then
-              echo "✅ Primary key stored (HTTP ${http_status})"
-              break
-            else
-              echo "⚠️ PUT returned HTTP ${http_status}"
-              [ -s /tmp/cf_put_resp ] && echo "=> Response:" && cat /tmp/cf_put_resp
-              
-              if [ $attempt -lt $max_attempts ]; then
-                sleep_seconds=$(( sleep_base * attempt ))
-                echo "=> Retrying in ${sleep_seconds}s..."
-                sleep $sleep_seconds
-              else
-                echo "❌ All PUT attempts failed"
-                exit 1
-              fi
-            fi
-          done
-
-          # Store Metadata in a separate key
-          META_KEY="${KEY}_metadata"
-          # Securely build JSON, handling empty values
-          META_VALUE=$(jq -n \
-            --arg ip "$VALUE" \
-            --arg loc "$LOCATION" \
-            --arg lat "$LATENCY" \
-            --arg ts "$TIMESTAMP" \
-            '{ip: $ip, location: $loc, latency: ($lat | tonumber), updated: $ts}')
-          
-          echo "=> Storing metadata: ${META_VALUE}"
-          meta_put_url="${API_BASE}/accounts/${ACCOUNT_ID}/storage/kv/namespaces/${NAMESPACE_ID}/values/${META_KEY}"
-          
-          http_status=$(curl -s -o /tmp/cf_meta_resp -w "%{http_code}" -X PUT \
-            -H "${AUTH_HEADER}" \
-            -H "Content-Type: application/json" \
-            --data-binary "${META_VALUE}" \
-            "${meta_put_url}" || echo "000")
-
-          if [ "$http_status" = "200" ] || [ "$http_status" = "201" ] || [ "$http_status" = "204" ]; then
-            echo "✅ Metadata stored (HTTP ${http_status})"
-          else
-            echo "⚠️ Metadata storage returned HTTP ${http_status} (non-critical)"
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "bestip=" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-          # Final verification of the stored value
-          echo "=> Verifying stored IP..."
-          get_url="${API_BASE}/accounts/${ACCOUNT_ID}/storage/kv/namespaces/${NAMESPACE_ID}/values/${KEY}"
-          http_status=$(curl -s -o /tmp/cf_get_resp -w "%{http_code}" -H "${AUTH_HEADER}" "${get_url}" || echo "000")
-          
-          if [ "$http_status" = "200" ]; then
-            stored_value=$(cat /tmp/cf_get_resp | tr -d '\r\n\t ')
-            if [ "$stored_value" = "$VALUE" ]; then
-              echo "✅ KV verification passed"
-            else
-              echo "⚠️ KV verification mismatch! Stored: '${stored_value}', Expected: '${VALUE}'"
+          SCORE_FILE="$TMPDIR/scores.txt"
+          echo "⚡ Measuring real network latency..."
+          while read -r latency ip; do
+            GEO=$(geoiplookup "$ip" | awk -F': ' '{print $2}' | cut -d',' -f1 | tr -d ' ')
+            LAT=${latency//[^0-9]/}
+            [ -z "$LAT" ] && LAT=9999
+
+            # Real ping measurement
+            REAL_PING=9999
+            if ping -c ${{ env.REAL_PING_TESTS }} -W 1 "$ip" >/tmp/pinglog 2>/dev/null; then
+              REAL_PING=$(awk -F'/' '/avg/ {print int($5)}' /tmp/pinglog || echo 9999)
             fi
+
+            GEO_BONUS=0
+            case "$GEO" in
+              ${LOCS//,/|}) GEO_BONUS=200 ;;
+            esac
+
+            SCORE=$(awk "BEGIN { print ((1000/($LAT+1)) + (1000/($REAL_PING+1)) + $GEO_BONUS) }")
+            echo "$SCORE $LAT $REAL_PING $GEO $ip" >> "$SCORE_FILE"
+          done < "$TMPDIR/proxies.txt"
+
+          sort -nrk1,1 "$SCORE_FILE" > "$TMPDIR/sorted.txt"
+          BEST=$(head -n 1 "$TMPDIR/sorted.txt")
+
+          BEST_SCORE=$(echo "$BEST" | awk '{print $1}')
+          BEST_LATENCY=$(echo "$BEST" | awk '{print $2}')
+          BEST_REALPING=$(echo "$BEST" | awk '{print $3}')
+          BEST_LOC=$(echo "$BEST" | awk '{print $4}')
+          BEST_IP=$(echo "$BEST" | awk '{print $5}')
+
+          echo "✅ Selected: $BEST_IP ($BEST_LOC) [Latency=${BEST_LATENCY}ms, RealPing=${BEST_REALPING}ms, Score=${BEST_SCORE}]"
+          echo "bestip=$BEST_IP" >> "$GITHUB_OUTPUT"
+          echo "location=$BEST_LOC" >> "$GITHUB_OUTPUT"
+          echo "latency=$BEST_LATENCY" >> "$GITHUB_OUTPUT"
+          echo "realping=$BEST_REALPING" >> "$GITHUB_OUTPUT"
+          echo "score=$BEST_SCORE" >> "$GITHUB_OUTPUT"
+
+      - name: Update Cloudflare D1 (SmartPing AI)
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_DATABASE_ID: ${{ secrets.CF_DATABASE_ID }}
+          IP: ${{ steps.scan.outputs.bestip }}
+          LOC: ${{ steps.scan.outputs.location }}
+          LAT: ${{ steps.scan.outputs.latency }}
+          RP: ${{ steps.scan.outputs.realping }}
+          SCORE: ${{ steps.scan.outputs.score }}
+        run: |
+          set -euo pipefail
+          API="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/d1/database/${CF_DATABASE_ID}/query"
+          AUTH="Authorization: Bearer ${CF_API_TOKEN}"
+          TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          echo "Fetching current active record..."
+          LAST=$(curl -s -X POST -H "${AUTH}" -H "Content-Type: application/json" \
+            --data '{"sql":"SELECT ip FROM proxy_updates WHERE id=1;"}' "$API" \
+            | jq -r '.result[0].results[0].ip // empty' || echo "")
+
+          if [ "$IP" = "$LAST" ]; then
+            echo "✅ IP unchanged — skipping update."
+            exit 0
+          fi
+
+          esc() { printf '%s' "$1" | sed "s/'/''/g"; }
+          IP_ESC=$(esc "$IP"); LOC_ESC=$(esc "$LOC")
+
+          SQL1="INSERT OR REPLACE INTO proxy_updates (id, ip, location, latency, real_ping, score, updated_at)
+                VALUES (1, '${IP_ESC}', '${LOC_ESC}', ${LAT:-0}, ${RP:-0}, ${SCORE:-0}, '${TS}');"
+          SQL2="INSERT INTO proxy_history (ip, location, latency, real_ping, score, updated_at)
+                VALUES ('${IP_ESC}', '${LOC_ESC}', ${LAT:-0}, ${RP:-0}, ${SCORE:-0}, '${TS}');"
+
+          BODY="{\"sql\":\"BEGIN; ${SQL1} ${SQL2} COMMIT;\"}"
+          STATUS=$(curl -s -o /tmp/resp -w "%{http_code}" -X POST -H "${AUTH}" -H "Content-Type: application/json" --data "$BODY" "$API" || echo "000")
+
+          if [ "$STATUS" = "200" ] || [ "$STATUS" = "201" ]; then
+            echo "✅ SmartPing update complete."
           else
-            echo "⚠️ GET for verification returned HTTP ${http_status}"
+            echo "❌ Update failed (HTTP $STATUS)"
+            cat /tmp/resp || true
+            exit 1
           fi
 
           echo ""
-          echo "=========================================="
-          echo "✅ Cloudflare KV UPDATE COMPLETE"
-          echo "=========================================="
-          echo "IP:       ${VALUE}"
-          echo "Location: ${LOCATION}"
-          echo "Latency:  ${LATENCY}ms"
-          echo "Updated:  ${TIMESTAMP}"
-          echo "=========================================="
-
+          echo "=============================="
+          echo "✔ SmartPing D1 Update Done"
+          echo "New IP: ${IP}"
+          echo "Region: ${LOC}"
+          echo "Latency: ${LAT}ms"
+          echo "Real Ping: ${RP}ms"
+          echo "Score: ${SCORE}"
+          echo "Time: ${TS}"
+          echo "=============================="
+          
       - name: Upload Cloudflare logs
         if: always()
         uses: actions/upload-artifact@v4
