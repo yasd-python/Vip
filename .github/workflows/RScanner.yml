@@ -1,7 +1,30 @@
-name: Rust Proxy Scanner - SmartPing Adaptive AI (D1 FIXED - Source Builds)
+Name: Rust Proxy Scanner - SmartPing Adaptive AI (D1 FIXED - Source Builds)
 
+# --- SMART INPUTS FOR MANUAL RUNS & SCHEDULE ---
 on:
+  # Manual trigger with dynamic inputs
   workflow_dispatch:
+    inputs:
+      targets:
+        description: 'Target IPs/ranges (e.g., "1.1.1.1/24, 8.8.8.8/24"). REQUIRED for Masscan/ZMap if USE_RSCANNER is false.'
+        required: false
+        default: '' 
+      use_masscan:
+        description: 'Enable Masscan?'
+        required: true
+        default: 'true'
+        type: boolean
+      use_zmap:
+        description: 'Enable ZMap?'
+        required: true
+        default: 'true'
+        type: boolean
+      use_rscanner:
+        description: 'Enable RScanner (Source Build)?'
+        required: true
+        default: 'false'
+        type: boolean
+  # Scheduled run every 6 hours
   schedule:
     - cron: '0 */6 * * *'
 
@@ -14,10 +37,13 @@ permissions:
   actions: write
 
 env:
-  TARGETS: ""
-  USE_MASSCAN: "true"
-  USE_ZMAP: "true"
-  USE_RSCANNER: "false"
+  # Use manual input for TARGETS, or fall back to a default list for scheduled runs.
+  TARGETS: ${{ github.event.inputs.targets || '1.1.1.1/24, 8.8.8.8/24, 2.2.2.2/24' }} 
+  # Use manual input for scanner selection, or fall back to defaults.
+  USE_MASSCAN: ${{ github.event.inputs.use_masscan || 'true' }}
+  USE_ZMAP: ${{ github.event.inputs.use_zmap || 'true' }}
+  USE_RSCANNER: ${{ github.event.inputs.use_rscanner || 'false' }}
+
   SCAN_BINARY: ./target/release/RScanner
 
   SCANNER_TIMEOUT: "600"
@@ -190,7 +216,7 @@ jobs:
           mkdir -p "$OUT_DIR"
 
           echo "🔍 Starting discovery phase..."
-          echo "Targets: ${TARGETS}"
+          echo "Targets: ${TARGETS}" 
 
           : > "${OUT_DIR}/discovered.txt"
 
@@ -203,12 +229,12 @@ jobs:
 
           # Masscan
           if [ "${USE_MASSCAN}" = "true" ] && command -v masscan &>/dev/null; then
-            if [ -n "${TARGETS}" ]; then
+            if [ -n "${TARGETS}" ]; then 
               echo "Running Masscan on ${TARGETS}..."
               sudo masscan -p80,443 ${TARGETS} --rate "${MASSCAN_RATE}" -oL "${OUT_DIR}/masscan.out" || true
               grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' "${OUT_DIR}/masscan.out" | sort -u >> "${OUT_DIR}/discovered.txt" || true
             else
-              echo "⚠️  SKIP Masscan: TARGETS not set"
+              echo "⚠️  SKIP Masscan: TARGETS not set (check workflow inputs or schedule targets)"
             fi
           else
             echo "⚠️ Masscan requested but not available"
@@ -225,7 +251,7 @@ jobs:
                 cut -d',' -f1 "${OUT_DIR}/zmap_${safe_name}.csv" 2>/dev/null | sort -u >> "${OUT_DIR}/discovered.txt" || true
               done
             else
-              echo "⚠️  SKIP ZMap: TARGETS not set"
+              echo "⚠️  SKIP ZMap: TARGETS not set (check workflow inputs or schedule targets)"
             fi
           else
             echo "⚠️ ZMap requested but not available"
@@ -237,7 +263,9 @@ jobs:
           echo "✅ Discovered ${DISCOVERED_COUNT} unique IPs"
 
           if [ "$DISCOVERED_COUNT" -eq 0 ]; then
-            echo "⚠️  No IPs discovered"
+            echo "⚠️  No IPs discovered - subsequent steps may be skipped."
+            # Ensure discovered file exists to prevent hard errors in next steps
+            touch "${GITHUB_WORKSPACE}/scan_results/discovered.txt" 
           fi
 
           mkdir -p "${GITHUB_WORKSPACE}/scan_results"
@@ -260,7 +288,7 @@ jobs:
             exit 0
           fi
 
-          echo "🔍 Running Nmap service detection..."
+          echo "🔍 Running Nmap service detection on $(wc -l < "$DISC") IPs..."
           nmap -sV -O -Pn -iL "$DISC" -oA "$OUTDIR/nmap_results" || true
           echo "✅ Nmap completed"
           echo "nmap_results=${OUTDIR}/nmap_results.xml" >> "${GITHUB_OUTPUT}"
