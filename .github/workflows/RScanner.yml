@@ -18,7 +18,7 @@ env:
   SCAN_LOG: scan.log
   SCANNER_TIMEOUT: "600"
   PRIORITY_LOCATIONS: "US,DE,GB,NL,FR,SG,JP,CA,AU,CH"
-  REAL_PING_TESTS: "3" # Number of actual ping tests per IP
+  REAL_PING_TESTS: "3"
 
 jobs:
   smartping:
@@ -97,7 +97,6 @@ jobs:
             LAT=${latency//[^0-9]/}
             [ -z "$LAT" ] && LAT=9999
 
-            # Real ping measurement
             REAL_PING=9999
             if ping -c ${{ env.REAL_PING_TESTS }} -W 1 "$ip" >/tmp/pinglog 2>/dev/null; then
               REAL_PING=$(awk -F'/' '/avg/ {print int($5)}' /tmp/pinglog || echo 9999)
@@ -183,23 +182,12 @@ jobs:
           echo "Score: ${SCORE}"
           echo "Time: ${TS}"
           echo "=============================="
-          
-      - name: Upload Cloudflare logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cf-rest-logs-${{ github.run_id }}
-          path: |
-            /tmp/cf_*.log
-            /tmp/cf_*_resp
-          retention-days: 7
-          if-no-files-found: ignore
 
   cleanup-runs:
     name: Delete old workflow runs
     runs-on: ubuntu-latest
-    needs: update-proxy-variable
-    if: always() # Always run, even if the previous step fails
+    needs: smartping
+    if: always()
     permissions:
       actions: write
       contents: read
@@ -209,6 +197,5 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           repository: ${{ github.repository }}
-          # Keep 0 days or the last 0 runs for debugging
           retain_days: 0
           keep_minimum_runs: 0
