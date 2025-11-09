@@ -52,7 +52,7 @@ env:
   DEBUG: "false"         # when "true" emits verbose logs
 
   # Output files
-  METRICS_OUTPUT: "metrics.json"
+  METRICS_OUTPUT: "metrics.ndjson"
   SUMMARY_OUTPUT: "scan_summary.json"
 
 jobs:
@@ -147,17 +147,24 @@ jobs:
 
           DRY_RUN="${{ env.DRY_RUN }}"
           DEBUG="${{ env.DEBUG }}"
-          METRICS="${{ env.METRICS_OUTPUT }}"
+          METRICS_FILE="${TMPDIR}/${{ env.METRICS_OUTPUT }}"
           SUMMARY="${{ env.SUMMARY_OUTPUT }}"
+          SCORE_RAW="${TMPDIR}/score_raw.txt"
 
           : > "$LOG"
+          : > "$METRICS_FILE"
+          : > "$SCORE_RAW"
+
           if [ ! -x "$BIN" ]; then chmod +x "$BIN" || true; fi
 
           echo "=> Running scanner with timeout ${TIMEOUT}s"
+          # run scanner (don't fail the step if it times out; we still want to parse whatever output it produced)
           timeout "${TIMEOUT}s" "$BIN" > "$LOG" 2>&1 || true
           echo "=> Scanner finished (or timed out). Log saved to $LOG"
 
-          # Retry logic for TCP connection tests with exponential backoff
+          # --- helper functions ---
+
+          # retry_with_backoff used for raw tcp connect attempts (returns 0 on success)
           retry_with_backoff() {
             local host="$1"
             local port="$2"
@@ -175,13 +182,14 @@ jobs:
             return 1
           }
 
-          # Implement retry for TCP tests here
           measure_tcp_rtt() {
             host="$1"; port="$2"; attempts="$3"
             best=9999
-            for i in $(seq 1 $attempts); do
+            for i in $(seq 1 "$attempts"); do
               if retry_with_backoff "$host" "$port"; then
                 start=$(date +%s%3N)
+                # quickly open/close connection to measure minimal RTT
+                timeout 2 bash -c "exec 3<>/dev/tcp/${host}/${port}" >/dev/null 2>&1 || true
                 end=$(date +%s%3N)
                 rtt=$((end-start))
                 if [ "$rtt" -lt "$best" ]; then best=$rtt; fi
@@ -190,9 +198,92 @@ jobs:
             echo "$best"
           }
 
-          # Parse PROXY LIVE lines and execute the rest of the tests
+          measure_tls() {
+            host="$1"; port="$2"; tout="$3"
+            # measure TLS handshake time using openssl s_client with timeout
+            start=$(date +%s%3N)
+            if timeout "${tout}s" bash -c "echo | openssl s_client -connect ${host}:${port} -servername google.com >/dev/null 2>&1"; then
+              end=$(date +%s%3N)
+              echo $((end-start))
+            else
+              echo 9999
+            fi
+          }
+
+          measure_http_and_throughput() {
+            proto="$1"; host="$2"; path="$3"; tout="$4"; max_bytes="$5"
+            # Use curl to fetch small resource, measure status, time (s), bytes downloaded
+            TMP_BODY="${TMPDIR}/http_body_$$"
+            : > "$TMP_BODY"
+            # use --insecure because IP-based TLS may not have valid cert; suppress errors
+            out=$(timeout "${tout}s" curl --max-time "${tout}" --insecure -sS -w "%{http_code},%{time_total},%{size_download}" -o "$TMP_BODY" "${proto}://${host}${path}" 2>/dev/null) || out=""
+            if [ -z "$out" ]; then
+              # failed
+              printf "0,9999,0,000"
+              return 0
+            fi
+            http_code=$(echo "$out" | cut -d',' -f1)
+            time_total=$(echo "$out" | cut -d',' -f2)
+            size_download=$(echo "$out" | cut -d',' -f3)
+            # convert time_total (seconds) to milliseconds
+            ms=$(awk -v t="$time_total" 'BEGIN{printf("%d", t*1000)}')
+            # throughput in bps = bytes / seconds (avoid division by zero)
+            if awk "BEGIN{exit !($time_total>0)}"; then
+              bps=$(awk -v b="$size_download" -v t="$time_total" 'BEGIN{printf("%d", (b*8)/t)}')
+            else
+              bps=0
+            fi
+            # ensure health_ok: 1 if http code 200-399
+            health_ok=0
+            if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 400 ]; then health_ok=1; fi
+            printf "%d,%s,%d,%03d" "$health_ok" "$ms" "$bps" "$http_code"
+            return 0
+          }
+
+          measure_stability() {
+            host="$1"; pings="$2"; proto="$3"; path="$4"; tout="$5"
+            # ping ratio
+            succ_ping=0
+            for i in $(seq 1 "$pings"); do
+              if timeout 2 ping -c 1 -W 1 "$host" >/dev/null 2>&1; then succ_ping=$((succ_ping+1)); fi
+            done
+            ping_ratio=$(awk -v s="$succ_ping" -v t="$pings" 'BEGIN{printf("%.2f", (t>0)?s/t:0)}')
+            # http ratio
+            succ_http=0
+            for i in $(seq 1 "$pings"); do
+              # small timeout for cached failures
+              if timeout "${tout}s" curl --max-time "${tout}" --insecure -sS -o /dev/null -w "%{http_code}" "${proto}://${host}${path}" 2>/dev/null | awk '{exit ($1>=200 && $1<400)?0:1}'; then
+                succ_http=$((succ_http+1))
+              fi
+            done
+            http_ratio=$(awk -v s="$succ_http" -v t="$pings" 'BEGIN{printf("%.2f", (t>0)?s/t:0)}')
+            printf "%s,%s" "$ping_ratio" "$http_ratio"
+          }
+
+          # --- create proxies list from the scanner log ---
+          # Try multiple heuristics to extract lines with IPs and optional latency numbers.
+          PROXIES_FILE="${TMPDIR}/proxies.txt"
+          : > "$PROXIES_FILE"
+
+          # Common patterns: "PROXY LIVE <lat> <ip>" or "LIVE <ip>" or "PROXY: ip:port"
+          # We'll search for IPv4 addresses in scanner log and (optionally) a preceding latency number.
+          grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' "$LOG" | uniq | while read -r ip; do
+            # attempt to find a latency number on same line (simple heuristic)
+            lat=$(grep -n "$ip" "$LOG" | head -n1 | awk -F: '{print $2}' | grep -Eo '[0-9]+' || true)
+            if [ -z "$lat" ]; then lat=9999; fi
+            echo "${lat} ${ip}" >> "$PROXIES_FILE"
+          done
+
+          # If PROXIES_FILE empty -> no proxies found; exit gracefully
+          if [ ! -s "$PROXIES_FILE" ]; then
+            echo "No proxies were found in $LOG — exiting successfully."
+            # still upload the log/empty metrics as artifacts if you want (not included here)
+            exit 0
+          fi
+
+          # --- iterate proxies and run tests ---
           while read -r lat ip; do
-            IP_CLEAN="$ip"
+            IP_CLEAN="${ip}"
             LAT=${lat//[^0-9]/}; [ -z "$LAT" ] && LAT=9999
 
             GEO_RAW=$(geoiplookup "$IP_CLEAN" 2>/dev/null || echo "")
@@ -202,7 +293,7 @@ jobs:
             # real ping
             REAL_PING=9999
             if ping -c ${REAL_PING_TESTS} -W 1 "$IP_CLEAN" >/tmp/pinglog 2>/dev/null; then
-              AVG=$(awk -F'/' '/rtt/ {print $5} END{if(NR==0) print ""}' /tmp/pinglog || true)
+              AVG=$(awk -F'/' '/rtt/ {print $5} END{if(NR==0) print ""}' /tmp/pinglog || echo "")
               if [ -n "$AVG" ]; then REAL_PING=$(printf "%.0f" "$AVG" 2>/dev/null || echo 9999); fi
             fi
 
@@ -252,10 +343,10 @@ jobs:
                              printf("%.6f", raw);
                           }')
 
-            # store raw metrics
+            # store raw metrics line (human readable)
             echo "${RAW_SCORE} ${LAT} ${REAL_PING} ${TCP_RTT} ${THROUGHPUT_BPS} ${TLS_MS} ${HEALTH_OK} ${HEALTH_LAT_MS} ${HEALTH_STATUS_CODE} ${PING_RATIO} ${HTTP_RATIO} ${GEO} ${IP_CLEAN}" >> "$SCORE_RAW"
 
-            # append json line
+            # append json ndjson line
             jq -nc --arg ip "$IP_CLEAN" --arg geo "$GEO" \
               --argjson lat "$LAT" --argjson realping "$REAL_PING" --argjson tcp "$TCP_RTT" \
               --argjson throughput "$THROUGHPUT_BPS" --argjson tls "$TLS_MS" \
@@ -263,8 +354,44 @@ jobs:
               --argjson health_status "$HEALTH_STATUS_CODE" --argjson ping_ratio "$PING_RATIO" --argjson http_ratio "$HTTP_RATIO" \
               --argjson raw "$RAW_SCORE" \
               '{ip:$ip,geo:$geo,latency:$lat,realping:$realping,tcp_rtt:$tcp,throughput_bps:$throughput,tls_ms:$tls,health_ok:$health_ok,health_latency_ms:$health_lat,health_status:$health_status,ping_ratio:$ping_ratio,http_ratio:$http_ratio,raw_score:$raw}' \
-              >> "$TMPDIR/$METRICS"
+              >> "$METRICS_FILE"
 
-          done < "$TMPDIR/proxies.txt"
-          
-          echo "Scanning completed. Raw scores and metrics saved."
+            if [ "${DEBUG}" = "true" ]; then
+              echo "DEBUG: metrics for $IP_CLEAN -> raw=$RAW_SCORE"
+            fi
+
+          done < "$PROXIES_FILE"
+
+          echo "Scanning completed. Raw scores and metrics saved to:"
+          echo " - $SCORE_RAW"
+          echo " - $METRICS_FILE"
+
+          # copy metrics to repository workspace so other steps can access (optional)
+          cp "$METRICS_FILE" "${GITHUB_WORKSPACE}/$(basename "$METRICS_FILE")" || true
+          cp "$SCORE_RAW" "${GITHUB_WORKSPACE}/$(basename "$SCORE_RAW")" || true
+
+          # Create a simple summary JSON (top 5 by raw score)
+          if command -v jq >/dev/null 2>&1 && [ -s "$METRICS_FILE" ]; then
+            jq -s 'sort_by(-.raw_score) | .[0:5]' "$METRICS_FILE" > "${GITHUB_WORKSPACE}/${SUMMARY}" || true
+            echo "Summary saved to ${SUMMARY}"
+          fi
+
+          # keep job successful
+          exit 0
+
+  cleanup-runs:
+    name: Delete old workflow runs
+    runs-on: ubuntu-latest
+    needs: smartping
+    if: always()
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Delete old workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          retain_days: 0
+          keep_minimum_runs: 0
