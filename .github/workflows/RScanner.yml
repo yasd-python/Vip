@@ -1,4 +1,4 @@
-Name: Rust Proxy Scanner - SmartPing Adaptive AI (D1 FIXED - Source Builds)
+name: Rust Proxy Scanner - SmartPing Adaptive AI (D1 FIXED - Source Builds)
 
 # --- SMART INPUTS FOR MANUAL RUNS & SCHEDULE ---
 on:
@@ -302,7 +302,7 @@ jobs:
 
           DISC="${{ steps.discover.outputs.discovered_file }}"
           METRICS_FILE="${TMPDIR}/${{ env.METRICS_OUTPUT }}"
-          SCORE_RAW="${TMPDIR}/score_raw.txt"
+          SCORE_RAW="${TMPD IR}/score_raw.txt"
 
           : > "$METRICS_FILE"
           : > "$SCORE_RAW"
