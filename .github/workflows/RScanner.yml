@@ -40,8 +40,25 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Build Rust scanner
-        run: cargo build --release
+      - name: Build Rust scanner (release)
+        id: build
+        run: |
+          set -euo pipefail
+          cargo build --release
+          BIN_NAME=$(cargo metadata --format-version 1 --no-deps 2>/dev/null | jq -r '.packages[0].targets[] | select(.kind[] | contains("bin")) | .name' | head -n1 || true)
+          if [ -n "$BIN_NAME" ]; then
+            DETECTED="./target/release/${BIN_NAME}"
+            if [ -x "$DETECTED" ]; then
+              echo "Detected binary: $DETECTED"
+              echo "bin_path=$DETECTED" >> "$GITHUB_OUTPUT"
+            else
+              echo "Warning: detected '$BIN_NAME' but not executable at $DETECTED"
+              echo "bin_path=${{ env.SCAN_BINARY }}" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "Could not detect binary name, using fallback."
+            echo "bin_path=${{ env.SCAN_BINARY }}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Learn adaptive regions from D1
         id: learn
@@ -50,18 +67,36 @@ jobs:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_DATABASE_ID: ${{ secrets.CF_DATABASE_ID }}
         run: |
+          set -euo pipefail
           API="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/d1/database/${CF_DATABASE_ID}/query"
           AUTH="Authorization: Bearer ${CF_API_TOKEN}"
 
           echo "🧠 Fetching historical performance data..."
           RESULT=$(curl -s -X POST -H "${AUTH}" -H "Content-Type: application/json" \
-            --data '{"sql":"SELECT location, AVG(score) AS avg_score FROM proxy_history GROUP BY location;"}' "$API")
+            --data '{"sql":"SELECT location, AVG(score) AS avg_score FROM proxy_history GROUP BY location;"}' "$API" || true)
 
-          LOCS=$(echo "$RESULT" | jq -r '.result[0].results[] | "\(.location):\(.avg_score)"' || true)
-          TOP=$(echo "$LOCS" | sort -t':' -k2 -nr | head -n5 | cut -d':' -f1 | tr '\n' ',' | sed 's/,$//')
-          [ -z "$TOP" ] && TOP="${{ env.PRIORITY_LOCATIONS }}"
+          LOCS=""
+          if echo "$RESULT" | jq -e '.result[0].results' >/dev/null 2>&1; then
+            LOCS=$(echo "$RESULT" | jq -r '.result[0].results[] | "\(.location):\(.avg_score)"' || true)
+          elif echo "$RESULT" | jq -e '.results' >/dev/null 2>&1; then
+            LOCS=$(echo "$RESULT" | jq -r '.results[] | "\(.location):\(.avg_score)"' || true)
+          else
+            LOCS=$(echo "$RESULT" | jq -r '.[] | "\(.location):\(.avg_score)"' || true)
+          fi
+
+          TOP=""
+          if [ -n "$LOCS" ]; then
+            TOP=$(echo "$LOCS" | sort -t':' -k2 -nr | head -n5 | cut -d':' -f1 | tr '\n' ',' | sed 's/,$//')
+          fi
+
+          if [ -z "$TOP" ]; then
+            TOP="${{ env.PRIORITY_LOCATIONS }}"
+            echo "No adaptive data found; falling back to PRIORITY_LOCATIONS."
+          else
+            echo "Adaptive learning prioritized: $TOP"
+          fi
+
           echo "adaptive_locs=$TOP" >> "$GITHUB_OUTPUT"
-          echo "Adaptive learning prioritized: $TOP"
 
       - name: Run Rust proxy scanner
         id: scan
@@ -69,22 +104,24 @@ jobs:
           ADAPTIVE_LOCS: ${{ steps.learn.outputs.adaptive_locs }}
         run: |
           set -euo pipefail
-          BIN="${{ env.SCAN_BINARY }}"
-          LOG="${{ env.SCAN_LOG }}"
           TMPDIR=$(mktemp -d)
-          LOCS="${ADAPTIVE_LOCS:-${{ env.PRIORITY_LOCATIONS }}}"
+          trap 'rm -rf "$TMPDIR"' EXIT
 
+          BIN="${{ steps.build.outputs.bin_path }}"
+          if [ -z "$BIN" ] || [ ! -x "$BIN" ]; then
+            BIN="${{ env.SCAN_BINARY }}"
+          fi
+
+          LOG="${{ env.SCAN_LOG }}"
+          LOCS="${ADAPTIVE_LOCS:-${{ env.PRIORITY_LOCATIONS }}}"
           echo "🌍 Adaptive scanning order: $LOCS"
+
           timeout "${{ env.SCANNER_TIMEOUT }}" "$BIN" > "$LOG" 2>&1 || true
 
-          awk 'BEGIN{IGNORECASE=1}/PROXY[[:space:]]+LIVE/{
-            if (match($0,/([0-9]{1,3}(\.[0-9]{1,3}){3})/,ip) && match($0,/\(([0-9]+)ms\)/,lat))
-              print lat[1], ip[1]
-          }' "$LOG" > "$TMPDIR/proxies.txt"
+          awk 'BEGIN{IGNORECASE=1}/PROXY[[:space:]]+LIVE/{if (match($0,/([0-9]{1,3}(\.[0-9]{1,3}){3})/,ip)&&match($0,/\(([0-9]+)ms\)/,lat))print lat[1],ip[1]}' "$LOG" > "$TMPDIR/proxies.txt" || true
 
           TOTAL=$(wc -l < "$TMPDIR/proxies.txt" || echo 0)
           echo "Found $TOTAL valid proxies."
-
           if [ "$TOTAL" -eq 0 ]; then
             echo "bestip=" >> "$GITHUB_OUTPUT"
             exit 0
@@ -95,25 +132,20 @@ jobs:
           while read -r latency ip; do
             GEO=$(geoiplookup "$ip" | awk -F': ' '{print $2}' | cut -d',' -f1 | tr -d ' ')
             LAT=${latency//[^0-9]/}
-            [ -z "$LAT" ] && LAT=9999
-
             REAL_PING=9999
             if ping -c ${{ env.REAL_PING_TESTS }} -W 1 "$ip" >/tmp/pinglog 2>/dev/null; then
               REAL_PING=$(awk -F'/' '/avg/ {print int($5)}' /tmp/pinglog || echo 9999)
             fi
-
             GEO_BONUS=0
             case "$GEO" in
               ${LOCS//,/|}) GEO_BONUS=200 ;;
             esac
-
             SCORE=$(awk "BEGIN { print ((1000/($LAT+1)) + (1000/($REAL_PING+1)) + $GEO_BONUS) }")
             echo "$SCORE $LAT $REAL_PING $GEO $ip" >> "$SCORE_FILE"
           done < "$TMPDIR/proxies.txt"
 
           sort -nrk1,1 "$SCORE_FILE" > "$TMPDIR/sorted.txt"
           BEST=$(head -n 1 "$TMPDIR/sorted.txt")
-
           BEST_SCORE=$(echo "$BEST" | awk '{print $1}')
           BEST_LATENCY=$(echo "$BEST" | awk '{print $2}')
           BEST_REALPING=$(echo "$BEST" | awk '{print $3}')
@@ -143,10 +175,14 @@ jobs:
           AUTH="Authorization: Bearer ${CF_API_TOKEN}"
           TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
+          if [ -z "${IP:-}" ]; then
+            echo "No IP found; skipping D1 update."
+            exit 0
+          fi
+
           echo "Fetching current active record..."
           LAST=$(curl -s -X POST -H "${AUTH}" -H "Content-Type: application/json" \
-            --data '{"sql":"SELECT ip FROM proxy_updates WHERE id=1;"}' "$API" \
-            | jq -r '.result[0].results[0].ip // empty' || echo "")
+            --data '{"sql":"SELECT ip FROM proxy_updates WHERE id=1;"}' "$API" | jq -r '.result[0].results[0].ip // empty' || echo "")
 
           if [ "$IP" = "$LAST" ]; then
             echo "✅ IP unchanged — skipping update."
@@ -156,10 +192,8 @@ jobs:
           esc() { printf '%s' "$1" | sed "s/'/''/g"; }
           IP_ESC=$(esc "$IP"); LOC_ESC=$(esc "$LOC")
 
-          SQL1="INSERT OR REPLACE INTO proxy_updates (id, ip, location, latency, real_ping, score, updated_at)
-                VALUES (1, '${IP_ESC}', '${LOC_ESC}', ${LAT:-0}, ${RP:-0}, ${SCORE:-0}, '${TS}');"
-          SQL2="INSERT INTO proxy_history (ip, location, latency, real_ping, score, updated_at)
-                VALUES ('${IP_ESC}', '${LOC_ESC}', ${LAT:-0}, ${RP:-0}, ${SCORE:-0}, '${TS}');"
+          SQL1="INSERT OR REPLACE INTO proxy_updates (id, ip, location, latency, real_ping, score, updated_at) VALUES (1, '${IP_ESC}', '${LOC_ESC}', ${LAT:-0}, ${RP:-0}, ${SCORE:-0}, '${TS}');"
+          SQL2="INSERT INTO proxy_history (ip, location, latency, real_ping, score, updated_at) VALUES ('${IP_ESC}', '${LOC_ESC}', ${LAT:-0}, ${RP:-0}, ${SCORE:-0}, '${TS}');"
 
           BODY="{\"sql\":\"BEGIN; ${SQL1} ${SQL2} COMMIT;\"}"
           STATUS=$(curl -s -o /tmp/resp -w "%{http_code}" -X POST -H "${AUTH}" -H "Content-Type: application/json" --data "$BODY" "$API" || echo "000")
