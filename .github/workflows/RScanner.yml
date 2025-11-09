@@ -3,7 +3,7 @@ name: Rust Proxy Scanner - Multi-Location KV Update (Enhanced V2)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */2 * * *' # Runs every 2 hours
+    - cron: '0 */6 * * *' # Runs every 6 hours
 
 concurrency:
   group: rust-proxy-scan-multi-location
