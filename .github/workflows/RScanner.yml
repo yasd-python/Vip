@@ -550,26 +550,26 @@ jobs:
               if [ "$HTTP_CODE" = "200" ]; then
                 SUCCESS=$(echo "$BODY" | jq -r '.success // false')
                 if [ "$SUCCESS" = "true" ]; then
-                  echo "✅ $description (attempt $attempt)"
+                  echo "✅ $description (attempt $attempt)" >&2
                   echo "$BODY"
                   return 0
                 else
-                  echo "WARNING: API returned success=false for: $description"
-                  echo "$BODY" | jq '.' || echo "$BODY"
+                  echo "WARNING: API returned success=false for: $description" >&2
+                  echo "$BODY" | jq '.' || echo "$BODY" >&2
                 fi
               else
-                echo "WARNING: HTTP $HTTP_CODE for: $description (attempt $attempt/$MAX_RETRIES)"
-                echo "$BODY" | jq '.' || echo "$BODY"
+                echo "WARNING: HTTP $HTTP_CODE for: $description (attempt $attempt/$MAX_RETRIES)" >&2
+                echo "$BODY" | jq '.' || echo "$BODY" >&2
               fi
               
               if [ $attempt -lt $MAX_RETRIES ]; then
                 sleep_time=$((SLEEP_BASE * attempt))
-                echo "   Retrying in ${sleep_time}s..."
+                echo "   Retrying in ${sleep_time}s..." >&2
                 sleep $sleep_time
               fi
             done
             
-            echo "ERROR: Failed after $MAX_RETRIES attempts: $description"
+            echo "ERROR: Failed after $MAX_RETRIES attempts: $description" >&2
             return 1
           }
           
@@ -839,14 +839,15 @@ jobs:
             if [ "$HTTP_CODE" = "200" ]; then
               SUCCESS=$(echo "$BODY" | jq -r '.success // false')
               if [ "$SUCCESS" = "true" ]; then
-                echo "✅ $desc"
+                echo "✅ $desc" >&2
+                echo "$BODY"
                 return 0
               else
-                echo "WARNING: $desc failed"
+                echo "WARNING: $desc failed" >&2
                 return 1
               fi
             else
-              echo "ERROR: $desc failed (HTTP $HTTP_CODE)"
+              echo "ERROR: $desc failed (HTTP $HTTP_CODE)" >&2
               return 1
             fi
           }
@@ -863,10 +864,7 @@ jobs:
             MIN(total_score) as min_score
           FROM proxy_scans"
           
-          STATS_BODY=$(curl -s -X POST "$DB_ENDPOINT" \
-            -H "Authorization: Bearer ${CF_API_TOKEN}" \
-            -H "Content-Type: application/json" \
-            --data "$(jq -n --arg sql "$ANALYZE_SQL" '{sql: $sql}')")
+          STATS_BODY=$(execute_query "$ANALYZE_SQL" "Analyze statistics")
           
           echo "$STATS_BODY" | jq -r '.result[0].results[0] | 
             "Total Records:     \(.total_records)",
