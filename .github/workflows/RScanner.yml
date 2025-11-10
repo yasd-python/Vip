@@ -17,7 +17,7 @@ on:
         default: 'AUTO'
         type: string
   schedule:
-    - cron: '0 */4 * * *' # Runs every 4 hours
+    - cron: '0 */4 * * *'
 
 concurrency:
   group: rust-proxy-scan-d1-advanced
@@ -57,13 +57,12 @@ jobs:
       - name: Install system dependencies with intelligent detection
         run: |
           set -euo pipefail
-          echo "╔════════════════════════════════════════════════════════╗"
-          echo "║  Installing System Dependencies (Smart Detection)     ║"
-          echo "╚════════════════════════════════════════════════════════╝"
+          echo "════════════════════════════════════════════════════════"
+          echo "  Installing System Dependencies (Smart Detection)"
+          echo "════════════════════════════════════════════════════════"
           
           sudo apt-get update -qq
           
-          # Core dependencies
           PACKAGES=(
             jq curl netcat-openbsd build-essential pkg-config
             libssl-dev ca-certificates coreutils bc dnsutils
@@ -73,16 +72,14 @@ jobs:
           echo "=> Installing core packages..."
           sudo apt-get install -y "${PACKAGES[@]}" > /dev/null 2>&1
           
-          # Smart GeoIP installation
           if ! command -v geoiplookup &> /dev/null; then
             echo "=> Installing GeoIP tools..."
             sudo apt-get install -y geoip-bin geoip-database > /dev/null 2>&1
           fi
           
-          # Verify critical tools
           for tool in jq curl bc geoiplookup ping; do
             if ! command -v "$tool" &> /dev/null; then
-              echo "❌ FATAL: Required tool '$tool' not found after installation"
+              echo "ERROR: Required tool '$tool' not found after installation"
               exit 1
             fi
           done
@@ -109,20 +106,20 @@ jobs:
       - name: Build Rust scanner with optimizations
         run: |
           set -euo pipefail
-          echo "╔════════════════════════════════════════════════════════╗"
-          echo "║  Building Rust Scanner (Release + Optimizations)      ║"
-          echo "╚════════════════════════════════════════════════════════╝"
+          echo "════════════════════════════════════════════════════════"
+          echo "  Building Rust Scanner (Release + Optimizations)"
+          echo "════════════════════════════════════════════════════════"
           
           export RUSTFLAGS="-C target-cpu=native -C opt-level=3"
           
           if ! cargo build --release 2>&1 | tee build-output.log; then
-            echo "❌ Build failed. Last 300 lines:"
+            echo "ERROR: Build failed. Last 300 lines:"
             tail -n 300 build-output.log
             exit 1
           fi
           
           if [ ! -f "${{ env.SCAN_BINARY }}" ]; then
-            echo "❌ Scanner binary not found at expected path"
+            echo "ERROR: Scanner binary not found at expected path"
             ls -la target/release/ || true
             exit 1
           fi
@@ -136,17 +133,15 @@ jobs:
         timeout-minutes: 20
         run: |
           set -euo pipefail
-          echo "╔════════════════════════════════════════════════════════╗"
-          echo "║  Phase 1: Network Discovery & Initial Scanning         ║"
-          echo "╚════════════════════════════════════════════════════════╝"
+          echo "════════════════════════════════════════════════════════"
+          echo "  Phase 1: Network Discovery & Initial Scanning"
+          echo "════════════════════════════════════════════════════════"
           
           BIN="${{ env.SCAN_BINARY }}"
           LOG="${{ env.SCAN_LOG }}"
           METRICS="${{ env.METRICS_FILE }}"
           TIMEOUT="${{ env.SCANNER_TIMEOUT }}"
-          FORCE_SCAN="${{ github.event.inputs.force_scan }}"
           
-          # Create working directory
           WORK_DIR=$(mktemp -d)
           trap "rm -rf '$WORK_DIR'" EXIT
           
@@ -154,11 +149,9 @@ jobs:
           LIVE_IPS="$WORK_DIR/live_ips.txt"
           SCORED_RESULTS="$WORK_DIR/scored_results.json"
           
-          # Initialize files
           : > "$LOG"
           : > "$RAW_SCAN"
           
-          # Run primary scanner
           echo "=> Starting network scanner..."
           START_TIME=$(date +%s)
           
@@ -173,18 +166,17 @@ jobs:
           if [ "$SCAN_EXIT" -eq 0 ]; then
             echo "✅ Scanner completed in ${SCAN_DURATION}s"
           elif [ "$SCAN_EXIT" -eq 124 ]; then
-            echo "⚠️  Scanner timeout (${TIMEOUT}s) - using partial results"
+            echo "WARNING: Scanner timeout (${TIMEOUT}s) - using partial results"
           else
-            echo "⚠️  Scanner exit code $SCAN_EXIT - continuing with available data"
+            echo "WARNING: Scanner exit code $SCAN_EXIT - continuing with available data"
           fi
           
           cp "$RAW_SCAN" "$LOG"
           
-          # Parse live IPs with enhanced validation
           echo ""
-          echo "╔════════════════════════════════════════════════════════╗"
-          echo "║  Phase 2: IP Validation & GeoIP Classification        ║"
-          echo "╚════════════════════════════════════════════════════════╝"
+          echo "════════════════════════════════════════════════════════"
+          echo "  Phase 2: IP Validation & GeoIP Classification"
+          echo "════════════════════════════════════════════════════════"
           
           awk 'BEGIN{IGNORECASE=1}
             /PROXY[[:space:]]+LIVE/ {
@@ -209,11 +201,10 @@ jobs:
           echo "=> Discovered $TOTAL_IPS valid live proxies"
           
           if [ "$TOTAL_IPS" -eq 0 ]; then
-            echo "❌ No live proxies discovered in scan"
+            echo "ERROR: No live proxies discovered in scan"
             exit 1
           fi
           
-          # Determine target location
           RUN_NUMBER=${{ github.run_number }}
           TARGET_LOC="${{ github.event.inputs.target_location }}"
           
@@ -226,13 +217,11 @@ jobs:
           
           echo "🌍 Target Location: $TARGET_LOC (Run #$RUN_NUMBER)"
           
-          # Advanced health testing function
           test_proxy_health() {
             local ip=$1
             local score=0
             local details=""
             
-            # ICMP ping test (20 points)
             if ping -c 3 -W 2 "$ip" > /dev/null 2>&1; then
               score=$((score + 20))
               details="${details}PING:OK "
@@ -240,7 +229,6 @@ jobs:
               details="${details}PING:FAIL "
             fi
             
-            # TCP connectivity test (15 points)
             if timeout 3 nc -zv "$ip" 443 > /dev/null 2>&1; then
               score=$((score + 15))
               details="${details}TCP:OK "
@@ -248,7 +236,6 @@ jobs:
               details="${details}TCP:FAIL "
             fi
             
-            # DNS resolution test (10 points)
             if timeout 3 nc -zv "$ip" 53 > /dev/null 2>&1; then
               score=$((score + 10))
               details="${details}DNS:OK "
@@ -259,7 +246,6 @@ jobs:
             echo "$score|$details"
           }
           
-          # Calculate stability score
           calc_stability() {
             local ip=$1
             local test_count=3
@@ -276,9 +262,9 @@ jobs:
           }
           
           echo ""
-          echo "╔════════════════════════════════════════════════════════╗"
-          echo "║  Phase 3: Advanced Health Testing & AI Scoring        ║"
-          echo "╚════════════════════════════════════════════════════════╝"
+          echo "════════════════════════════════════════════════════════"
+          echo "  Phase 3: Advanced Health Testing & AI Scoring"
+          echo "════════════════════════════════════════════════════════"
           
           > "$SCORED_RESULTS"
           PROCESSED=0
@@ -286,10 +272,8 @@ jobs:
           while read -r initial_latency ip; do
             PROCESSED=$((PROCESSED + 1))
             
-            # Get GeoIP location
             GEO_INFO=$(geoiplookup "$ip" 2>/dev/null | awk -F': ' '/GeoIP Country Edition:/ {print $2}' | cut -d',' -f1 | tr -d ' ' || echo "XX")
             
-            # Location matching score (25 points if matches target)
             if [ "$GEO_INFO" = "$TARGET_LOC" ]; then
               LOC_SCORE=25
               LOC_MATCH="true"
@@ -298,16 +282,13 @@ jobs:
               LOC_MATCH="false"
             fi
             
-            # Run health tests
             HEALTH_RESULT=$(test_proxy_health "$ip")
             HEALTH_SCORE=$(echo "$HEALTH_RESULT" | cut -d'|' -f1)
             HEALTH_DETAILS=$(echo "$HEALTH_RESULT" | cut -d'|' -f2)
             
-            # Calculate stability
             STABILITY=$(calc_stability "$ip")
             STABILITY_SCORE=$(echo "scale=0; $STABILITY / 5" | bc)
             
-            # Latency score (inverse relationship, max 20 points)
             if [ "$initial_latency" -lt 50 ]; then
               LAT_SCORE=20
             elif [ "$initial_latency" -lt 100 ]; then
@@ -320,10 +301,8 @@ jobs:
               LAT_SCORE=1
             fi
             
-            # Calculate total weighted score
             TOTAL_SCORE=$((LOC_SCORE + HEALTH_SCORE + STABILITY_SCORE + LAT_SCORE))
             
-            # Store as JSON line
             jq -n \
               --arg ip "$ip" \
               --arg loc "$GEO_INFO" \
@@ -352,11 +331,10 @@ jobs:
           
           echo "✅ Completed testing $PROCESSED proxies"
           
-          # Select best proxy based on comprehensive scoring
           echo ""
-          echo "╔════════════════════════════════════════════════════════╗"
-          echo "║  Phase 4: Intelligent Selection & Ranking             ║"
-          echo "╚════════════════════════════════════════════════════════╝"
+          echo "════════════════════════════════════════════════════════"
+          echo "  Phase 4: Intelligent Selection & Ranking"
+          echo "════════════════════════════════════════════════════════"
           
           BEST_PROXY=$(jq -s 'sort_by(-.total_score) | .[0]' "$SCORED_RESULTS")
           
@@ -375,11 +353,9 @@ jobs:
           echo "   Health Score:    $BEST_HEALTH/45"
           echo "   Stability:       ${BEST_STAB}%"
           
-          # Generate top 10 ranking
           TOP_10=$(jq -s 'sort_by(-.total_score) | .[0:10]' "$SCORED_RESULTS")
           echo "$TOP_10" > "$WORK_DIR/top_10_proxies.json"
           
-          # Create metrics summary
           jq -n \
             --arg total "$TOTAL_IPS" \
             --arg processed "$PROCESSED" \
@@ -399,7 +375,6 @@ jobs:
               top_10_ranking: $top10
             }' > "$METRICS"
           
-          # Set outputs
           echo "bestip=$BEST_IP" >> "$GITHUB_OUTPUT"
           echo "location=$BEST_LOC" >> "$GITHUB_OUTPUT"
           echo "latency=$BEST_LAT" >> "$GITHUB_OUTPUT"
@@ -418,14 +393,13 @@ jobs:
           D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
         run: |
           set -euo pipefail
-          echo "╔════════════════════════════════════════════════════════╗"
-          echo "║  Initializing D1 Database Schema (REST API)           ║"
-          echo "╚════════════════════════════════════════════════════════╝"
+          echo "════════════════════════════════════════════════════════"
+          echo "  Initializing D1 Database Schema (REST API)"
+          echo "════════════════════════════════════════════════════════"
           
-          # Verify required secrets
           for var in CF_ACCOUNT_ID CF_API_TOKEN D1_DATABASE_ID; do
             if [ -z "${!var}" ]; then
-              echo "❌ ERROR: Secret $var is not set"
+              echo "ERROR: Secret $var is not set"
               exit 1
             fi
           done
@@ -433,7 +407,6 @@ jobs:
           API_BASE="https://api.cloudflare.com/client/v4"
           DB_ENDPOINT="${API_BASE}/accounts/${CF_ACCOUNT_ID}/d1/database/${D1_DATABASE_ID}/query"
           
-          # Create comprehensive schema
           SCHEMA_SQL='CREATE TABLE IF NOT EXISTS proxy_scans (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ip TEXT NOT NULL,
@@ -461,7 +434,6 @@ jobs:
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
           );'
           
-          # Execute schema creation
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$DB_ENDPOINT" \
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
             -H "Content-Type: application/json" \
@@ -475,14 +447,14 @@ jobs:
             if [ "$SUCCESS" = "true" ]; then
               echo "✅ Database schema initialized successfully"
             else
-              echo "⚠️  Schema response: $BODY"
+              echo "WARNING: Schema response: $BODY"
               ERRORS=$(echo "$BODY" | jq -r '.errors[]?.message // empty' | head -5)
               if [ -n "$ERRORS" ]; then
                 echo "Errors: $ERRORS"
               fi
             fi
           else
-            echo "❌ Schema creation failed with HTTP $HTTP_CODE"
+            echo "ERROR: Schema creation failed with HTTP $HTTP_CODE"
             echo "$BODY" | jq '.' || echo "$BODY"
             exit 1
           fi
@@ -502,9 +474,9 @@ jobs:
           TOTAL_TESTED: ${{ steps.scan.outputs.total_tested }}
         run: |
           set -euo pipefail
-          echo "╔════════════════════════════════════════════════════════╗"
-          echo "║  Storing Scan Results in D1 Database                  ║"
-          echo "╚════════════════════════════════════════════════════════╝"
+          echo "════════════════════════════════════════════════════════"
+          echo "  Storing Scan Results in D1 Database"
+          echo "════════════════════════════════════════════════════════"
           
           API_BASE="https://api.cloudflare.com/client/v4"
           DB_ENDPOINT="${API_BASE}/accounts/${CF_ACCOUNT_ID}/d1/database/${D1_DATABASE_ID}/query"
@@ -513,7 +485,6 @@ jobs:
           TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           RUN_NUM=${{ github.run_number }}
           
-          # Function for executing D1 queries with retry logic
           execute_d1_query() {
             local sql=$1
             local description=$2
@@ -537,11 +508,11 @@ jobs:
                   echo "$BODY"
                   return 0
                 else
-                  echo "⚠️  API returned success=false for: $description"
+                  echo "WARNING: API returned success=false for: $description"
                   echo "$BODY" | jq '.'
                 fi
               else
-                echo "⚠️  HTTP $HTTP_CODE for: $description (attempt $attempt/$MAX_RETRIES)"
+                echo "WARNING: HTTP $HTTP_CODE for: $description (attempt $attempt/$MAX_RETRIES)"
               fi
               
               if [ $attempt -lt $MAX_RETRIES ]; then
@@ -551,16 +522,14 @@ jobs:
               fi
             done
             
-            echo "❌ Failed after $MAX_RETRIES attempts: $description"
+            echo "ERROR: Failed after $MAX_RETRIES attempts: $description"
             return 1
           }
           
-          # Step 1: Reset previous "current best" flags
           echo "=> Resetting previous best flags..."
           RESET_SQL="UPDATE proxy_scans SET is_current_best = 0 WHERE is_current_best = 1"
           execute_d1_query "$RESET_SQL" "Reset previous best flags" || true
           
-          # Step 2: Insert new scan result
           echo ""
           echo "=> Inserting new scan result..."
           INSERT_SQL="INSERT INTO proxy_scans (
@@ -573,18 +542,16 @@ jobs:
           )"
           
           if ! execute_d1_query "$INSERT_SQL" "Insert scan result"; then
-            echo "❌ Failed to insert scan result"
+            echo "ERROR: Failed to insert scan result"
             exit 1
           fi
           
-          # Get the inserted row ID
           LAST_ID_SQL="SELECT last_insert_rowid() as id"
           LAST_ID_RESPONSE=$(execute_d1_query "$LAST_ID_SQL" "Get last insert ID")
           SCAN_ID=$(echo "$LAST_ID_RESPONSE" | jq -r '.result[0].results[0].id // 0')
           
           echo "   Inserted with ID: $SCAN_ID"
           
-          # Step 3: Insert metadata
           echo ""
           echo "=> Inserting scan metadata..."
           META_SQL="INSERT INTO scan_metadata (
@@ -597,7 +564,6 @@ jobs:
           
           execute_d1_query "$META_SQL" "Insert metadata" || true
           
-          # Step 4: Verification query
           echo ""
           echo "=> Verifying stored data..."
           VERIFY_SQL="SELECT * FROM proxy_scans WHERE id = ${SCAN_ID}"
@@ -608,10 +574,9 @@ jobs:
           if [ "$STORED_IP" = "$BEST_IP" ]; then
             echo "✅ Data verification passed"
           else
-            echo "⚠️  Verification mismatch! Stored: '$STORED_IP', Expected: '$BEST_IP'"
+            echo "WARNING: Verification mismatch! Stored: '$STORED_IP', Expected: '$BEST_IP'"
           fi
           
-          # Step 5: Cleanup old records (keep last 1000)
           echo ""
           echo "=> Cleaning up old records..."
           CLEANUP_SQL="DELETE FROM proxy_scans WHERE id NOT IN (
@@ -619,7 +584,6 @@ jobs:
           )"
           execute_d1_query "$CLEANUP_SQL" "Cleanup old records" || true
           
-          # Step 6: Generate summary statistics
           echo ""
           echo "=> Generating statistics..."
           STATS_SQL="SELECT 
@@ -634,9 +598,9 @@ jobs:
           STATS_RESPONSE=$(execute_d1_query "$STATS_SQL" "Get statistics")
           
           echo ""
-          echo "╔════════════════════════════════════════════════════════╗"
-          echo "║  D1 DATABASE UPDATE SUMMARY                            ║"
-          echo "╚════════════════════════════════════════════════════════╝"
+          echo "════════════════════════════════════════════════════════"
+          echo "  D1 DATABASE UPDATE SUMMARY"
+          echo "════════════════════════════════════════════════════════"
           echo "IP:              $BEST_IP"
           echo "Location:        $LOCATION"
           echo "Latency:         ${LATENCY}ms"
@@ -653,7 +617,7 @@ jobs:
             "  Avg Score:       \(.avg_score)",
             "  Max Score:       \(.max_score)",
             "  Avg Latency:     \(.avg_latency)ms"' || echo "  (Statistics unavailable)"
-          echo "╚════════════════════════════════════════════════════════╝"
+          echo "════════════════════════════════════════════════════════"
           
           echo "scan_id=$SCAN_ID" >> "$GITHUB_OUTPUT"
 
@@ -665,9 +629,9 @@ jobs:
           D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
         run: |
           set -euo pipefail
-          echo "╔════════════════════════════════════════════════════════╗"
-          echo "║  Top 10 Performing Proxies (All Time)                 ║"
-          echo "╚════════════════════════════════════════════════════════╝"
+          echo "════════════════════════════════════════════════════════"
+          echo "  Top 10 Performing Proxies (All Time)"
+          echo "════════════════════════════════════════════════════════"
           
           API_BASE="https://api.cloudflare.com/client/v4"
           DB_ENDPOINT="${API_BASE}/accounts/${CF_ACCOUNT_ID}/d1/database/${D1_DATABASE_ID}/query"
@@ -688,211 +652,6 @@ jobs:
             "[\(.total_score)] \(.ip) | \(.location) | \(.latency)ms | Health:\(.health_score) | Stability:\(.stability)% | \(.scan_timestamp)"
           ' || echo "Unable to retrieve top performers"
 
-      - name: Export analytics and reports
-        if: always()
-        run: |
-          set -euo pipefail
-          echo "╔════════════════════════════════════════════════════════╗"
-          echo "║  Generating Analytics Reports                          ║"
-          echo "╚════════════════════════════════════════════════════════╝"
-          
-          REPORT_DIR="reports"
-          mkdir -p "$REPORT_DIR"
-          
-          # Create HTML report
-          cat > "$REPORT_DIR/scan_report.html" <<'HTMLEOF'
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Proxy Scan Report</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { 
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            padding: 20px;
-            color: #333;
-        }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            background: white;
-            border-radius: 10px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.1);
-            overflow: hidden;
-        }
-        .header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 30px;
-            text-align: center;
-        }
-        .header h1 { font-size: 2.5em; margin-bottom: 10px; }
-        .header p { font-size: 1.1em; opacity: 0.9; }
-        .content { padding: 30px; }
-        .metric-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
-        }
-        .metric-card {
-            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-            padding: 20px;
-            border-radius: 8px;
-            text-align: center;
-            transition: transform 0.3s;
-        }
-        .metric-card:hover { transform: translateY(-5px); }
-        .metric-value {
-            font-size: 2em;
-            font-weight: bold;
-            color: #667eea;
-            margin: 10px 0;
-        }
-        .metric-label {
-            font-size: 0.9em;
-            color: #666;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-        .section {
-            margin-bottom: 30px;
-            padding: 20px;
-            background: #f8f9fa;
-            border-radius: 8px;
-        }
-        .section h2 {
-            color: #667eea;
-            margin-bottom: 15px;
-            border-bottom: 2px solid #667eea;
-            padding-bottom: 10px;
-        }
-        .timestamp {
-            text-align: center;
-            color: #999;
-            font-size: 0.9em;
-            padding: 20px;
-            border-top: 1px solid #eee;
-        }
-        .status-badge {
-            display: inline-block;
-            padding: 5px 15px;
-            border-radius: 20px;
-            font-size: 0.85em;
-            font-weight: bold;
-        }
-        .status-success { background: #10b981; color: white; }
-        .status-warning { background: #f59e0b; color: white; }
-        .status-info { background: #3b82f6; color: white; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>🚀 Advanced Proxy Scanner Report</h1>
-            <p>Intelligent Network Analysis & Performance Metrics</p>
-        </div>
-        <div class="content">
-            <div class="metric-grid">
-                <div class="metric-card">
-                    <div class="metric-label">Best IP</div>
-                    <div class="metric-value" style="font-size: 1.2em;">$BEST_IP</div>
-                    <span class="status-badge status-success">Active</span>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">Total Score</div>
-                    <div class="metric-value">$SCORE/100</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">Latency</div>
-                    <div class="metric-value">${LATENCY}ms</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">Location</div>
-                    <div class="metric-value" style="font-size: 1.5em;">$LOCATION</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">Health Score</div>
-                    <div class="metric-value">$HEALTH/45</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">Stability</div>
-                    <div class="metric-value">${STABILITY}%</div>
-                </div>
-            </div>
-            
-            <div class="section">
-                <h2>📊 Scan Summary</h2>
-                <p><strong>Total Proxies Tested:</strong> $TOTAL_TESTED</p>
-                <p><strong>Workflow Run:</strong> #$RUN_NUM</p>
-                <p><strong>Target Location:</strong> $TARGET_LOC</p>
-                <p><strong>Database ID:</strong> $SCAN_ID</p>
-            </div>
-            
-            <div class="section">
-                <h2>🎯 Performance Indicators</h2>
-                <p>✅ Network connectivity verified</p>
-                <p>✅ GeoIP location confirmed</p>
-                <p>✅ Health checks passed</p>
-                <p>✅ Stability tests completed</p>
-                <p>✅ Database updated successfully</p>
-            </div>
-        </div>
-        <div class="timestamp">
-            Generated on $(date -u +"%Y-%m-%d %H:%M:%S UTC") | Run #${{ github.run_number }}
-        </div>
-    </div>
-</body>
-</html>
-HTMLEOF
-          
-          # Replace placeholders with actual values
-          sed -i "s/\$BEST_IP/${{ steps.scan.outputs.bestip }}/g" "$REPORT_DIR/scan_report.html"
-          sed -i "s/\$SCORE/${{ steps.scan.outputs.score }}/g" "$REPORT_DIR/scan_report.html"
-          sed -i "s/\$LATENCY/${{ steps.scan.outputs.latency }}/g" "$REPORT_DIR/scan_report.html"
-          sed -i "s/\$LOCATION/${{ steps.scan.outputs.location }}/g" "$REPORT_DIR/scan_report.html"
-          sed -i "s/\$HEALTH/${{ steps.scan.outputs.health }}/g" "$REPORT_DIR/scan_report.html"
-          sed -i "s/\$STABILITY/${{ steps.scan.outputs.stability }}/g" "$REPORT_DIR/scan_report.html"
-          sed -i "s/\$TOTAL_TESTED/${{ steps.scan.outputs.total_tested }}/g" "$REPORT_DIR/scan_report.html"
-          sed -i "s/\$RUN_NUM/${{ github.run_number }}/g" "$REPORT_DIR/scan_report.html"
-          sed -i "s/\$SCAN_ID/${{ steps.store_d1.outputs.scan_id }}/g" "$REPORT_DIR/scan_report.html"
-          sed -i "s/\$TARGET_LOC/${{ env.PRIORITY_LOCATIONS }}/g" "$REPORT_DIR/scan_report.html"
-          
-          # Create JSON export
-          cat > "$REPORT_DIR/scan_export.json" <<JSONEOF
-{
-  "scan_result": {
-    "best_proxy": {
-      "ip": "${{ steps.scan.outputs.bestip }}",
-      "location": "${{ steps.scan.outputs.location }}",
-      "latency_ms": ${{ steps.scan.outputs.latency }},
-      "total_score": ${{ steps.scan.outputs.score }},
-      "health_score": ${{ steps.scan.outputs.health }},
-      "stability_percent": ${{ steps.scan.outputs.stability }}
-    },
-    "scan_metadata": {
-      "total_tested": ${{ steps.scan.outputs.total_tested }},
-      "workflow_run": ${{ github.run_number }},
-      "database_id": ${{ steps.store_d1.outputs.scan_id }},
-      "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-      "target_location": "${{ env.PRIORITY_LOCATIONS }}"
-    }
-  }
-}
-JSONEOF
-          
-          # Create CSV export
-          cat > "$REPORT_DIR/scan_results.csv" <<CSVEOF
-IP,Location,Latency_ms,Total_Score,Health_Score,Stability_Percent,Timestamp
-${{ steps.scan.outputs.bestip }},${{ steps.scan.outputs.location }},${{ steps.scan.outputs.latency }},${{ steps.scan.outputs.score }},${{ steps.scan.outputs.health }},${{ steps.scan.outputs.stability }},$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-CSVEOF
-          
-          echo "✅ Reports generated successfully"
-          ls -lh "$REPORT_DIR/"
-
       - name: Upload all artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -901,21 +660,20 @@ CSVEOF
           path: |
             ${{ env.SCAN_LOG }}
             ${{ env.METRICS_FILE }}
-            reports/
           retention-days: 30
           if-no-files-found: warn
 
       - name: Create workflow summary
         if: always()
         run: |
-          cat >> $GITHUB_STEP_SUMMARY <<SUMMARY
+          cat >> $GITHUB_STEP_SUMMARY << 'SUMMARY'
           # 🚀 Advanced Proxy Scanner - Execution Summary
           
           ## 📊 Scan Results
           
           | Metric | Value |
           |--------|-------|
-          | **Best IP** | \`${{ steps.scan.outputs.bestip }}\` |
+          | **Best IP** | `${{ steps.scan.outputs.bestip }}` |
           | **Location** | ${{ steps.scan.outputs.location }} 🌍 |
           | **Latency** | ${{ steps.scan.outputs.latency }}ms ⚡ |
           | **Total Score** | ${{ steps.scan.outputs.score }}/100 🎯 |
@@ -927,7 +685,6 @@ CSVEOF
           - **Total Proxies Tested**: ${{ steps.scan.outputs.total_tested }}
           - **Workflow Run**: #${{ github.run_number }}
           - **Database Record ID**: ${{ steps.store_d1.outputs.scan_id }}
-          - **Timestamp**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
           
           ## ✅ Status Checks
           
@@ -936,11 +693,6 @@ CSVEOF
           - ✅ Health tests performed
           - ✅ Stability analysis done
           - ✅ D1 database updated
-          - ✅ Reports generated
-          
-          ## 📁 Artifacts
-          
-          All scan logs, metrics, and reports have been uploaded as workflow artifacts.
           
           ---
           
@@ -950,9 +702,9 @@ CSVEOF
       - name: Health check notification
         if: failure()
         run: |
-          echo "╔════════════════════════════════════════════════════════╗"
-          echo "║  ⚠️  WORKFLOW FAILURE DETECTED                         ║"
-          echo "╚════════════════════════════════════════════════════════╝"
+          echo "════════════════════════════════════════════════════════"
+          echo "  ⚠️  WORKFLOW FAILURE DETECTED"
+          echo "════════════════════════════════════════════════════════"
           echo ""
           echo "One or more steps in the workflow failed."
           echo "Please review the logs above for detailed error information."
@@ -995,9 +747,9 @@ CSVEOF
       - name: Optimize database and create backup
         run: |
           set -euo pipefail
-          echo "╔════════════════════════════════════════════════════════╗"
-          echo "║  Database Maintenance & Optimization                   ║"
-          echo "╚════════════════════════════════════════════════════════╝"
+          echo "════════════════════════════════════════════════════════"
+          echo "  Database Maintenance & Optimization"
+          echo "════════════════════════════════════════════════════════"
           
           API_BASE="https://api.cloudflare.com/client/v4"
           DB_ENDPOINT="${API_BASE}/accounts/${CF_ACCOUNT_ID}/d1/database/${D1_DATABASE_ID}/query"
@@ -1016,12 +768,11 @@ CSVEOF
               echo "✅ $desc"
               return 0
             else
-              echo "⚠️  $desc failed"
+              echo "WARNING: $desc failed"
               return 1
             fi
           }
           
-          # Analyze database performance
           echo "=> Analyzing database statistics..."
           ANALYZE_SQL="SELECT 
             COUNT(*) as total_records,
@@ -1049,7 +800,6 @@ CSVEOF
             "Max Score:         \(.max_score)",
             "Min Score:         \(.min_score)"' || true
           
-          # Remove duplicate entries (keep best score)
           echo ""
           echo "=> Removing duplicate entries..."
           DEDUP_SQL="DELETE FROM proxy_scans WHERE id NOT IN (
@@ -1058,16 +808,14 @@ CSVEOF
           )"
           execute_query "$DEDUP_SQL" "Deduplication" || true
           
-          # Archive old low-performing records
           echo ""
           echo "=> Archiving old low-performing records..."
           ARCHIVE_SQL="DELETE FROM proxy_scans 
-          WHERE total_score < ${{ env.MIN_SCORE_THRESHOLD }} 
+          WHERE total_score < 50 
           AND created_at < datetime('now', '-30 days')
           AND is_current_best = 0"
           execute_query "$ARCHIVE_SQL" "Archive low performers" || true
           
-          # Vacuum and optimize
           echo ""
           echo "=> Optimizing database..."
           execute_query "VACUUM" "Database vacuum" || true
@@ -1089,14 +837,13 @@ CSVEOF
       - name: Generate trend analysis
         run: |
           set -euo pipefail
-          echo "╔════════════════════════════════════════════════════════╗"
-          echo "║  Performance Trend Analysis                            ║"
-          echo "╚════════════════════════════════════════════════════════╝"
+          echo "════════════════════════════════════════════════════════"
+          echo "  Performance Trend Analysis"
+          echo "════════════════════════════════════════════════════════"
           
           API_BASE="https://api.cloudflare.com/client/v4"
           DB_ENDPOINT="${API_BASE}/accounts/${CF_ACCOUNT_ID}/d1/database/${D1_DATABASE_ID}/query"
           
-          # Last 24 hours trend
           TREND_SQL="SELECT 
             strftime('%Y-%m-%d %H:00', created_at) as hour,
             AVG(total_score) as avg_score,
@@ -1118,7 +865,6 @@ CSVEOF
               "\(.hour) | Score: \(.avg_score) | Latency: \(.avg_latency)ms | Scans: \(.scan_count)"' || \
             echo "Unable to retrieve trend data"
           
-          # Location distribution
           echo ""
           echo "🌍 Location Distribution (Last 7 Days):"
           echo ""
