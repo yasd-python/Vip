@@ -1,563 +1,612 @@
-name: Rust Proxy Scanner - SmartPing Adaptive AI (D1 FIXED - Source Builds)
-
-# --- SMART INPUTS FOR MANUAL RUNS & SCHEDULE ---
-on:
-  # Manual trigger with dynamic inputs
-  workflow_dispatch:
-    inputs:
-      targets:
-        description: 'Target IPs/ranges (e.g., "1.1.1.1/24, 8.8.8.8/24"). REQUIRED for Masscan/ZMap if USE_RSCANNER is false.'
-        required: false
-        default: '' 
-      use_masscan: I 
-        description: 'Enable Masscan?'
-        required: true
-        default: 'true'
-        type: boolean
-      use_zmap:
-        description: 'Enable ZMap?'
-        required: true
-        default: 'true'
-        type: boolean
-      use_rscanner:
-        description: 'Enable RScanner (Source Build)?'
-        required: true
-        default: 'false'
-        type: boolean
-  # Scheduled run every 6 hours
-  schedule:
-    - cron: '0 */6 * * *'
-
-concurrency:
-  group: rust-proxy-smartping-d1-fixed
-  cancel-in-progress: true
-
-permissions:
-  contents: read
-  actions: write
-
-env:
-  # Use manual input for TARGETS, or fall back to a default list for scheduled runs.
-  TARGETS: ${{ github.event.inputs.targets || '1.1.1.1/24, 8.8.8.8/24, 2.2.2.2/24' }} 
-  # Use manual input for scanner selection, or fall back to defaults.
-  USE_MASSCAN: ${{ github.event.inputs.use_masscan || 'true' }}
-  USE_ZMAP: ${{ github.event.inputs.use_zmap || 'true' }}
-  USE_RSCANNER: ${{ github.event.inputs.use_rscanner || 'false' }}
-
-  SCAN_BINARY: ./target/release/RScanner
-
-  SCANNER_TIMEOUT: "600"
-  MASSCAN_RATE: "10000"
-  ZMAP_BANDWIDTH: "50M"
-  PRIORITY_LOCATIONS: "US,DE,GB,NL,FR,SG,JP,CA,AU,CH"
-  REAL_PING_TESTS: "3"
-
-  TCP_CONNECT_TESTS: "1"
-  TCP_TEST_PORT: "443"
-
-  HEALTH_URL_PATH: "/favicon.ico"
-  HEALTH_HTTP_TIMEOUT: "5"
-  TLS_TEST_PORT: "443"
-  TLS_TIMEOUT: "5"
-
-  THROUGHPUT_TEST_URL: "https://speed.cloudflare.com/__down"
-  THROUGHPUT_TEST_BYTES: "10000000"
-  THROUGHPUT_TEST_COUNT: "3"
-  THROUGHPUT_TIMEOUT: "30"
-
-  W_SCANNER_LATENCY: "0.18"
-  W_REAL_PING: "0.22"
-  W_TCP_RTT: "0.05"
-  W_THROUGHPUT: "0.25"
-  W_TLS_HANDSHAKE: "0.10"
-  W_HEALTH: "0.10"
-  W_STABILITY: "0.05"
-  W_GEO_BONUS: "200"
-
-  DRY_RUN: "false"
-  DEBUG: "true"
-
-  METRICS_OUTPUT: "metrics.ndjson"
-  SUMMARY_OUTPUT: "scan_summary.json"
-
-jobs:
-  smartping:
-    name: Scan → Test → Score → Save to D1 (Source Builds)
-    runs-on: ubuntu-latest
-    timeout-minutes: 150
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Install base packages and build deps
-        run: |
-          set -euo pipefail
-          echo "📦 Updating apt and installing base packages..."
-          sudo apt-get update -y
-          sudo apt-get install -y \
-            git build-essential cmake make pkg-config \
-            libpcap-dev libgcrypt20-dev libssl-dev \
-            jq curl geoip-bin iputils-ping netcat-openbsd \
-            ca-certificates wget unzip bzip2
-
-          # helpful tooling
-          sudo apt-get install -y nmap openssl
-
-          echo "✅ Base packages installed"
-
-      - name: Build Masscan from source
-        if: env.USE_MASSCAN == 'true'
-        run: |
-          set -euo pipefail
-          WORK=/tmp/masscan_build
-          rm -rf "$WORK"
-          mkdir -p "$WORK"
-          cd "$WORK"
-
-          echo "📡 Cloning Masscan..."
-          git clone --depth 1 https://github.com/robertdavidgraham/masscan.git . || {
-            echo "❌ masscan git clone failed"
-            exit 1
-          }
-
-          echo "🔧 Building Masscan (make -j)..."
-          export CFLAGS="-O2 -fPIC"
-          make -j"$(nproc)" || {
-            echo "❌ masscan build failed; printing last 200 lines of output"
-            tail -n 200 Makefile || true
-            exit 1
-          }
-
-          if [ -f bin/masscan ]; then
-            sudo cp -f bin/masscan /usr/local/bin/masscan
-            sudo chmod +x /usr/local/bin/masscan
-            echo "✅ masscan installed to /usr/local/bin/masscan"
-            /usr/local/bin/masscan --version || true
-          else
-            echo "❌ masscan binary not found after build"
-            ls -la || true
-            exit 1
-          fi
-
-      - name: Build ZMap from source
-        if: env.USE_ZMAP == 'true'
-        run: |
-          set -euo pipefail
-          WORK=/tmp/zmap_build
-          rm -rf "$WORK"
-          mkdir -p "$WORK"
-          cd "$WORK"
-
-          echo "🧭 Cloning ZMap..."
-          git clone --depth 1 https://github.com/zmap/zmap.git . || {
-            echo "❌ zmap git clone failed"
-            exit 1
-          }
-
-          echo "🔧 Preparing ZMap build..."
-          mkdir -p build
-          cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release || {
-            echo "❌ cmake configuration failed for zmap"
-            exit 1
-          }
-
-          echo "🔧 Building ZMap (make -j)..."
-          make -j"$(nproc)" || {
-            echo "❌ zmap make failed; listing build dir"
-            ls -la || true
-            exit 1
-          }
-
-          if [ -f src/zmap ]; then
-            sudo cp -f src/zmap /usr/local/bin/zmap
-            sudo chmod +x /usr/local/bin/zmap
-            echo "✅ zmap installed to /usr/local/bin/zmap"
-            /usr/local/bin/zmap --version || true
-          else
-            FOUND=$(find . -type f -name zmap -perm -111 -print -quit || true)
-            if [ -n "$FOUND" ]; then
-              sudo cp -f "$FOUND" /usr/local/bin/zmap
-              sudo chmod +x /usr/local/bin/zmap
-              echo "✅ zmap installed from $FOUND"
-            else
-              echo "❌ zmap binary not found after build"
-              ls -la || true
-              exit 1
-            fi
-          fi
-
-      - name: Install Rust toolchain (optional, for RScanner)
-        if: env.USE_RSCANNER == 'true'
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-
-      - name: Build RScanner (optional)
-        if: env.USE_RSCANNER == 'true'
-        run: |
-          set -euo pipefail
-          echo "🔨 Building RScanner..."
-          cargo build --release
-          ls -lah target/release/ || true
-          echo "✅ RScanner build finished"
-
-      - name: Discovery Phase
-        id: discover
-        run: |
-          set -euo pipefail
-          TMPDIR=$(mktemp -d)
-          trap 'rm -rf "$TMPDIR"' EXIT
-
-          OUT_DIR="${TMPDIR}/out"
-          mkdir -p "$OUT_DIR"
-
-          echo "🔍 Starting discovery phase..."
-          echo "Targets: ${TARGETS}" 
-
-          : > "${OUT_DIR}/discovered.txt"
-
-          # RScanner
-          if [ "${USE_RSCANNER}" = "true" ] && [ -x "${SCAN_BINARY}" ]; then
-            echo "Running RScanner..."
-            timeout "${SCANNER_TIMEOUT}s" "${SCAN_BINARY}" > "${OUT_DIR}/rscanner.log" 2>&1 || true
-            grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' "${OUT_DIR}/rscanner.log" | sort -u >> "${OUT_DIR}/discovered.txt" || true
-          fi
-
-          # Masscan
-          if [ "${USE_MASSCAN}" = "true" ] && command -v masscan &>/dev/null; then
-            if [ -n "${TARGETS}" ]; then 
-              echo "Running Masscan on ${TARGETS}..."
-              sudo masscan -p80,443 ${TARGETS} --rate "${MASSCAN_RATE}" -oL "${OUT_DIR}/masscan.out" || true
-              grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' "${OUT_DIR}/masscan.out" | sort -u >> "${OUT_DIR}/discovered.txt" || true
-            else
-              echo "⚠️  SKIP Masscan: TARGETS not set (check workflow inputs or schedule targets)"
-            fi
-          else
-            echo "⚠️ Masscan requested but not available"
-          fi
-
-          # ZMap - note: zmap typically scans one prefix/target at a time
-          if [ "${USE_ZMAP}" = "true" ] && command -v zmap &>/dev/null; then
-            if [ -n "${TARGETS}" ]; then
-              echo "Running ZMap..."
-              IFS=',' read -ra ADDR <<< "${TARGETS}"
-              for t in "${ADDR[@]}"; do
-                safe_name=$(echo "${t}" | tr '/,' '__')
-                sudo zmap -p 80 "${t}" -B "${ZMAP_BANDWIDTH}" -o "${OUT_DIR}/zmap_${safe_name}.csv" || true
-                cut -d',' -f1 "${OUT_DIR}/zmap_${safe_name}.csv" 2>/dev/null | sort -u >> "${OUT_DIR}/discovered.txt" || true
-              done
-            else
-              echo "⚠️  SKIP ZMap: TARGETS not set (check workflow inputs or schedule targets)"
-            fi
-          else
-            echo "⚠️ ZMap requested but not available"
-          fi
-
-          sort -u "${OUT_DIR}/discovered.txt" -o "${OUT_DIR}/discovered.txt" || true
-
-          DISCOVERED_COUNT=$(wc -l < "${OUT_DIR}/discovered.txt" || echo 0)
-          echo "✅ Discovered ${DISCOVERED_COUNT} unique IPs"
-
-          if [ "$DISCOVERED_COUNT" -eq 0 ]; then
-            echo "⚠️  No IPs discovered - subsequent steps may be skipped."
-            # Ensure discovered file exists to prevent hard errors in next steps
-            touch "${GITHUB_WORKSPACE}/scan_results/discovered.txt" 
-          fi
-
-          mkdir -p "${GITHUB_WORKSPACE}/scan_results"
-          cp "${OUT_DIR}/discovered.txt" "${GITHUB_WORKSPACE}/scan_results/discovered.txt" || true
-
-          echo "discovered_file=${GITHUB_WORKSPACE}/scan_results/discovered.txt" >> "${GITHUB_OUTPUT}"
-
-      - name: Run Nmap
-        if: always()
-        id: nmap
-        run: |
-          set -euo pipefail
-          DISC="${{ steps.discover.outputs.discovered_file }}"
-          OUTDIR="${GITHUB_WORKSPACE}/scan_results"
-          mkdir -p "$OUTDIR"
-
-          if [ ! -s "$DISC" ]; then
-            echo "⚠️  No discovered IPs for Nmap; skipping"
-            echo "nmap_results=" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-
-          echo "🔍 Running Nmap service detection on $(wc -l < "$DISC") IPs..."
-          nmap -sV -O -Pn -iL "$DISC" -oA "$OUTDIR/nmap_results" || true
-          echo "✅ Nmap completed"
-          echo "nmap_results=${OUTDIR}/nmap_results.xml" >> "${GITHUB_OUTPUT}"
-
-      - name: Advanced Tests and Scoring
-        id: advanced
-        run: |
-          set -euo pipefail
-          TMPDIR=$(mktemp -d)
-          trap 'rm -rf "$TMPDIR"' EXIT
-
-          DISC="${{ steps.discover.outputs.discovered_file }}"
-          METRICS_FILE="${TMPDIR}/${{ env.METRICS_OUTPUT }}"
-          SCORE_RAW="${TMPD IR}/score_raw.txt"
-
-          : > "$METRICS_FILE"
-          : > "$SCORE_RAW"
-
-          if [ ! -s "${DISC}" ]; then
-            echo "⚠️  No IPs to test"
-            exit 0
-          fi
-
-          retry_with_backoff() {
-            local host="$1" port="$2"
-            local max_retries=5 delay=1 retries=0
-            while [ $retries -lt $max_retries ]; do
-              if timeout 1 bash -c "cat < /dev/tcp/${host}/${port} >/dev/null 2>&1"; then
-                return 0
-              fi
-              retries=$((retries+1))
-              sleep $delay
-              delay=$((delay*2))
-            done
-            return 1
-          }
-
-          measure_tcp_rtt() {
-            local host="$1" port="$2" attempts="$3"
-            local best=9999
-            for i in $(seq 1 "$attempts"); do
-              if retry_with_backoff "$host" "$port"; then
-                local start=$(date +%s%3N)
-                timeout 2 bash -c "exec 3<>/dev/tcp/${host}/${port}" >/dev/null 2>&1 || true
-                local end=$(date +%s%3N)
-                local rtt=$((end-start))
-                if [ "$rtt" -lt "$best" ]; then best=$rtt; fi
-              fi
-            done
-            echo "$best"
-          }
-
-          measure_tls() {
-            local host="$1" port="$2" tout="$3"
-            local start=$(date +%s%3N)
-            if timeout "${tout}s" bash -c "echo | openssl s_client -connect ${host}:${port} -servername ${host} >/dev/null 2>&1"; then
-              local end=$(date +%s%3N)
-              echo $((end-start))
-            else
-              echo 9999
-            fi
-          }
-
-          measure_health() {
-            local proto="$1" host="$2" path="$3" tout="$4"
-            local out
-            out=$(timeout "${tout}s" curl --max-time "${tout}" --insecure -sS -w "%{http_code},%{time_total}" -o /dev/null "${proto}://${host}${path}" 2>/dev/null) || out=""
-            if [ -z "$out" ]; then
-              printf "0,9999,000"
-              return 0
-            fi
-            local http_code=$(echo "$out" | cut -d',' -f1)
-            local time_total=$(echo "$out" | cut -d',' -f2)
-            local ms=$(awk -v t="$time_total" 'BEGIN{printf("%d", t*1000)}')
-            local health_ok=0
-            if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 400 ]; then health_ok=1; fi
-            printf "%d,%s,%03d" "$health_ok" "$ms" "$http_code"
-          }
-
-          measure_single_throughput() {
-            local proto="$1" host="$2" url="$3" bytes="$4" tout="$5"
-            local out
-            out=$(timeout "${tout}s" curl --max-time "${tout}" \
-              --proxy "${proto}://${host}" \
-              --insecure -sS -w "%{time_total},%{size_download}" \
-              -o /dev/null \
-              "${url}?bytes=${bytes}" 2>/dev/null) || out=""
-            if [ -z "$out" ]; then echo 0; return 0; fi
-            local time_total=$(echo "$out" | cut -d',' -f1)
-            local size_download=$(echo "$out" | cut -d',' -f2)
-            if awk "BEGIN{exit !($time_total>0 && $size_download==${THROUGHPUT_TEST_BYTES})}"; then
-              local bps=$(awk -v b="$size_download" -v t="$time_total" 'BEGIN{printf("%d", (b*8)/t)}')
-              echo "$bps"
-            else
-              echo 0
-            fi
-          }
-
-          measure_stability() {
-            local host="$1" pings="$2" proto="$3" path="$4" tout="$5"
-            local succ_ping=0
-            for i in $(seq 1 "$pings"); do
-              if timeout 2 ping -c 1 -W 1 "$host" >/dev/null 2>&1; then
-                succ_ping=$((succ_ping+1))
-              fi
-            done
-            local ping_ratio=$(awk -v s="$succ_ping" -v t="$pings" 'BEGIN{printf("%.2f", (t>0)?s/t:0)}')
-            local succ_http=0
-            for i in $(seq 1 "$pings"); do
-              if timeout "${tout}s" curl --max-time "${tout}" --insecure -sS -o /dev/null -w "%{http_code}" "${proto}://${host}${path}" 2>/dev/null | awk '{exit ($1>=200 && $1<400)?0:1}'; then
-                succ_http=$((succ_http+1))
-              fi
-            done
-            local http_ratio=$(awk -v s="$succ_http" -v t="$pings" 'BEGIN{printf("%.2f", (t>0)?s/t:0)}')
-            printf "%s,%s" "$ping_ratio" "$http_ratio"
-          }
-
-          echo "🧪 Starting advanced tests..."
-          TOTAL_IPS=$(wc -l < "${DISC}")
-          CURRENT=0
-
-          while read -r ip; do
-            CURRENT=$((CURRENT+1))
-            echo "Testing IP $CURRENT/$TOTAL_IPS: $ip"
-
-            IP_CLEAN="${ip}"
-            LAT=9999
-
-            # Geo
-            GEO_RAW=$(geoiplookup "$IP_CLEAN" 2>/dev/null || echo "")
-            GEO=$(echo "$GEO_RAW" | awk -F': ' '{print $2}' | cut -d',' -f1 | tr -d ' ')
-            [ -z "$GEO" ] && GEO="XX"
-
-            # 1) Real ping
-            REAL_PING=9999
-            if ping -c "${REAL_PING_TESTS}" -W 1 "$IP_CLEAN" >/tmp/pinglog 2>/dev/null; then
-              AVG=$(awk -F'/' '/rtt/ {print $5}' /tmp/pinglog | head -1)
-              if [ -n "$AVG" ]; then
-                REAL_PING=$(printf "%.0f" "$AVG" 2>/dev/null || echo 9999)
-              fi
-            fi
-
-            # 2) TCP RTT
-            TCP_RTT=9999
-            if [ "${TCP_CONNECT_TESTS}" -gt 0 ]; then
-              TCP_RTT=$(measure_tcp_rtt "$IP_CLEAN" "${TCP_TEST_PORT}" "${TCP_CONNECT_TESTS}")
-            fi
-
-            # 3) TLS
-            TLS_MS=9999
-            TLS_MS=$(measure_tls "$IP_CLEAN" "${TLS_TEST_PORT}" "${TLS_TIMEOUT}")
-
-            # 4) Health
-            HTTP_PROTO="https"
-            HEALTH_RES=$(measure_health "$HTTP_PROTO" "$IP_CLEAN" "${HEALTH_URL_PATH}" "${HEALTH_HTTP_TIMEOUT}")
-            HEALTH_OK=$(echo "$HEALTH_RES" | cut -d',' -f1)
-            HEALTH_LAT_MS=$(echo "$HEALTH_RES" | cut -d',' -f2)
-            HEALTH_STATUS_CODE=$(echo "$HEALTH_RES" | cut -d',' -f3)
-
-            # 5) Throughput
-            THROUGHPUT_BPS=0
-            if [ "$HEALTH_OK" -eq 1 ]; then
-              RAW_BPS_RESULTS="${TMPDIR}/bps_${IP_CLEAN}.txt"
-              : > "$RAW_BPS_RESULTS"
-              for i in $(seq 1 "${THROUGHPUT_TEST_COUNT}"); do
-                bps_run=$(measure_single_throughput "$HTTP_PROTO" "$IP_CLEAN" "${THROUGHPUT_TEST_URL}" "${THROUGHPUT_TEST_BYTES}" "${THROUGHPUT_TIMEOUT}")
-                echo "$bps_run" >> "$RAW_BPS_RESULTS"
-              done
-              MEDIAN_BPS=$(sort -n "$RAW_BPS_RESULTS" | awk '{a[NR]=$1} END{if(NR==0) print 0; else if(NR%2==1) print a[int(NR/2)+1]; else print int((a[NR/2]+a[NR/2+1])/2)}')
-              THROUGHPUT_BPS=$(printf "%.0f" "$MEDIAN_BPS" 2>/dev/null || echo 0)
-            fi
-
-            # 6) Stability
-            STAB=$(measure_stability "$IP_CLEAN" 3 "$HTTP_PROTO" "${HEALTH_URL_PATH}" "${HEALTH_HTTP_TIMEOUT}")
-            PING_RATIO=$(echo "$STAB" | cut -d',' -f1)
-            HTTP_RATIO=$(echo "$STAB" | cut -d',' -f2)
-
-            # Calculate score
-            RAW_SCORE=$(awk -v w_lat="${W_SCANNER_LATENCY}" -v lat="$LAT" \
-                          -v w_rp="${W_REAL_PING}" -v rp="$REAL_PING" \
-                          -v w_tcp="${W_TCP_RTT}" -v tcp="$TCP_RTT" \
-                          -v w_thr="${W_THROUGHPUT}" -v thr="$THROUGHPUT_BPS" \
-                          -v w_tls="${W_TLS_HANDSHAKE}" -v tls="$TLS_MS" \
-                          -v w_health="${W_HEALTH}" -v health_ok="$HEALTH_OK" -v health_lat="$HEALTH_LAT_MS" \
-                          -v w_stab="${W_STABILITY}" -v ping_ratio="$PING_RATIO" -v http_ratio="$HTTP_RATIO" \
-                          'BEGIN{
-                             s_lat = (lat>0 && lat<9999 ? 1000/(lat+1) : 0);
-                             s_rp  = (rp>0 && rp<9999 ? 1000/(rp+1) : 0);
-                             s_tcp = (tcp<9999 && tcp>0 ? 1000/(tcp+1) : 0);
-                             s_thr = (thr>0 ? thr/1024.0 : 0);
-                             s_tls = (tls<9999 && tls>0 ? 1000/(tls+1) : 0);
-                             s_health = (health_ok==1 ? (1000/(health_lat+1)) : 0);
-                             s_stab = ((ping_ratio + http_ratio) / 2.0);
-                             raw = (w_lat*s_lat) + (w_rp*s_rp) + (w_tcp*s_tcp) + (w_thr*s_thr) + (w_tls*s_tls) + (w_health*s_health) + (w_stab*s_stab);
-                             printf("%.6f", raw);
-                          }')
-
-            echo "${RAW_SCORE} ${LAT} ${REAL_PING} ${TCP_RTT} ${THROUGHPUT_BPS} ${TLS_MS} ${HEALTH_OK} ${HEALTH_LAT_MS} ${HEALTH_STATUS_CODE} ${PING_RATIO} ${HTTP_RATIO} ${GEO} ${IP_CLEAN}" >> "$SCORE_RAW"
-
-            jq -nc --arg ip "$IP_CLEAN" --arg geo "$GEO" \
-              --argjson lat "$LAT" --argjson realping "$REAL_PING" --argjson tcp "$TCP_RTT" \
-              --argjson throughput "$THROUGHPUT_BPS" --argjson tls "$TLS_MS" \
-              --argjson health_ok "$HEALTH_OK" --argjson health_lat "$HEALTH_LAT_MS" \
-              --argjson health_status "$HEALTH_STATUS_CODE" \
-              --argjson ping_ratio "$PING_RATIO" --argjson http_ratio "$HTTP_RATIO" \
-              --argjson raw "$RAW_SCORE" \
-              '{ip:$ip,geo:$geo,latency:$lat,realping:$realping,tcp_rtt:$tcp,throughput_bps:$throughput,tls_ms:$tls,health_ok:$health_ok,health_latency_ms:$health_lat,health_status:$health_status,ping_ratio:$ping_ratio,http_ratio:$http_ratio,raw_score:$raw}' \
-              >> "$METRICS_FILE"
-
-            if [ "${DEBUG}" = "true" ]; then
-              echo "  Score: $RAW_SCORE | Ping: $REAL_PING | TCP: $TCP_RTT | Health: $HEALTH_OK | Thr: $THROUGHPUT_BPS"
-            fi
-
-          done < "${DISC}"
-
-          mkdir -p "${GITHUB_WORKSPACE}/scan_results"
-          cp "$METRICS_FILE" "${GITHUB_WORKSPACE}/scan_results/$(basename "$METRICS_FILE")" || true
-          cp "$SCORE_RAW" "${GITHUB_WORKSPACE}/scan_results/$(basename "$SCORE_RAW")" || true
-
-          if [ -s "$METRICS_FILE" ]; then
-            jq -s 'sort_by(-.raw_score) | .[0:5]' "$METRICS_FILE" > "${GITHUB_WORKSPACE}/${{ env.SUMMARY_OUTPUT }}" || true
-            echo "✅ Top 5 results saved to summary"
-          else
-            echo "⚠️ No metrics generated"
-          fi
-
-      - name: Setup Node (for Wrangler) and Install Wrangler
-        if: always()
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-
-      - name: Install Wrangler CLI
-        if: always()
-        run: |
-          set -euo pipefail
-          npm install -g wrangler@latest
-          wrangler --version || { echo "❌ Wrangler installation failed"; exit 1; }
-          echo "✅ Wrangler installed"
-
-      - name: Initialize and Save to Cloudflare D1
-        if: always()
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-          D1_DB_NAME: ${{ secrets.D1_DB_NAME }}
-        run: |
-   path: |
-            scan_results/
-            *.json
-            *.log
-            *.sql
-          retention-days: 7
-
-  cleanup:
-    name: Cleanup Old Runs
-    runs-on: ubuntu-latest
-    needs: smartping
-    if: always()
-    permissions:
-      actions: write
-      contents: read
-    steps:
-      - name: Delete Old Workflow Runs
-        uses: Mattraks/delete-workflow-runs@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          repository: ${{ github.repository }}
-          retain_days: 0
+Name: Rust Proxy Scanner - SmartPing Adaptive AI (D1 FIXED - Source Builds)  
+  
+on:  
+  workflow_dispatch:  
+  schedule:  
+    - cron: '0 */6 * * *'  
+  
+concurrency:  
+  group: rust-proxy-smartping-d1-fixed  
+  cancel-in-progress: true  
+  
+permissions:  
+  contents: read  
+  actions: write  
+  
+env:  
+  TARGETS: ""  
+  USE_MASSCAN: "true"  
+  USE_ZMAP: "true"  
+  USE_RSCANNER: "false"  
+  SCAN_BINARY: ./target/release/RScanner  
+  
+  SCANNER_TIMEOUT: "600"  
+  MASSCAN_RATE: "10000"  
+  ZMAP_BANDWIDTH: "50M"  
+  PRIORITY_LOCATIONS: "US,DE,GB,NL,FR,SG,JP,CA,AU,CH"  
+  REAL_PING_TESTS: "3"  
+  
+  TCP_CONNECT_TESTS: "1"  
+  TCP_TEST_PORT: "443"  
+  
+  HEALTH_URL_PATH: "/favicon.ico"  
+  HEALTH_HTTP_TIMEOUT: "5"  
+  TLS_TEST_PORT: "443"  
+  TLS_TIMEOUT: "5"  
+  
+  THROUGHPUT_TEST_URL: "https://speed.cloudflare.com/__down"  
+  THROUGHPUT_TEST_BYTES: "10000000"  
+  THROUGHPUT_TEST_COUNT: "3"  
+  THROUGHPUT_TIMEOUT: "30"  
+  
+  W_SCANNER_LATENCY: "0.18"  
+  W_REAL_PING: "0.22"  
+  W_TCP_RTT: "0.05"  
+  W_THROUGHPUT: "0.25"  
+  W_TLS_HANDSHAKE: "0.10"  
+  W_HEALTH: "0.10"  
+  W_STABILITY: "0.05"  
+  W_GEO_BONUS: "200"  
+  
+  DRY_RUN: "false"  
+  DEBUG: "true"  
+  
+  METRICS_OUTPUT: "metrics.ndjson"  
+  SUMMARY_OUTPUT: "scan_summary.json"  
+  
+jobs:  
+  smartping:  
+    name: Scan → Test → Score → Save to D1 (Source Builds)  
+    runs-on: ubuntu-latest  
+    timeout-minutes: 150  
+  
+    steps:  
+      - name: Checkout repository  
+        uses: actions/checkout@v4  
+        with:  
+          fetch-depth: 0  
+  
+      - name: Install base packages and build deps  
+        run: |  
+          set -euo pipefail  
+          echo "📦 Updating apt and installing base packages..."  
+          sudo apt-get update -y  
+          sudo apt-get install -y \  
+            git build-essential cmake make pkg-config \  
+            libpcap-dev libgcrypt20-dev libssl-dev \  
+            jq curl geoip-bin iputils-ping netcat-openbsd \  
+            ca-certificates wget unzip bzip2  
+  
+          # helpful tooling  
+          sudo apt-get install -y nmap openssl  
+  
+          echo "✅ Base packages installed"  
+  
+      - name: Build Masscan from source  
+        if: env.USE_MASSCAN == 'true'  
+        run: |  
+          set -euo pipefail  
+          WORK=/tmp/masscan_build  
+          rm -rf "$WORK"  
+          mkdir -p "$WORK"  
+          cd "$WORK"  
+  
+          echo "📡 Cloning Masscan..."  
+          git clone --depth 1 https://github.com/robertdavidgraham/masscan.git . || {  
+            echo "❌ masscan git clone failed"  
+            exit 1  
+          }  
+  
+          echo "🔧 Building Masscan (make -j)..."  
+          export CFLAGS="-O2 -fPIC"  
+          make -j"$(nproc)" || {  
+            echo "❌ masscan build failed; printing last 200 lines of output"  
+            tail -n 200 Makefile || true  
+            exit 1  
+          }  
+  
+          if [ -f bin/masscan ]; then  
+            sudo cp -f bin/masscan /usr/local/bin/masscan  
+            sudo chmod +x /usr/local/bin/masscan  
+            echo "✅ masscan installed to /usr/local/bin/masscan"  
+            /usr/local/bin/masscan --version || true  
+          else  
+            echo "❌ masscan binary not found after build"  
+            ls -la || true  
+            exit 1  
+          fi  
+  
+      - name: Build ZMap from source  
+        if: env.USE_ZMAP == 'true'  
+        run: |  
+          set -euo pipefail  
+          WORK=/tmp/zmap_build  
+          rm -rf "$WORK"  
+          mkdir -p "$WORK"  
+          cd "$WORK"  
+  
+          echo "🧭 Cloning ZMap..."  
+          git clone --depth 1 https://github.com/zmap/zmap.git . || {  
+            echo "❌ zmap git clone failed"  
+            exit 1  
+          }  
+  
+          echo "🔧 Preparing ZMap build..."  
+          mkdir -p build  
+          cd build  
+          cmake .. -DCMAKE_BUILD_TYPE=Release || {  
+            echo "❌ cmake configuration failed for zmap"  
+            exit 1  
+          }  
+  
+          echo "🔧 Building ZMap (make -j)..."  
+          make -j"$(nproc)" || {  
+            echo "❌ zmap make failed; listing build dir"  
+            ls -la || true  
+            exit 1  
+          }  
+  
+          if [ -f src/zmap ]; then  
+            sudo cp -f src/zmap /usr/local/bin/zmap  
+            sudo chmod +x /usr/local/bin/zmap  
+            echo "✅ zmap installed to /usr/local/bin/zmap"  
+            /usr/local/bin/zmap --version || true  
+          else  
+            FOUND=$(find . -type f -name zmap -perm -111 -print -quit || true)  
+            if [ -n "$FOUND" ]; then  
+              sudo cp -f "$FOUND" /usr/local/bin/zmap  
+              sudo chmod +x /usr/local/bin/zmap  
+              echo "✅ zmap installed from $FOUND"  
+            else  
+              echo "❌ zmap binary not found after build"  
+              ls -la || true  
+              exit 1  
+            fi  
+          fi  
+  
+      - name: Install Rust toolchain (optional, for RScanner)  
+        if: env.USE_RSCANNER == 'true'  
+        uses: dtolnay/rust-toolchain@stable  
+        with:  
+          toolchain: stable  
+  
+      - name: Build RScanner (optional)  
+        if: env.USE_RSCANNER == 'true'  
+        run: |  
+          set -euo pipefail  
+          echo "🔨 Building RScanner..."  
+          cargo build --release  
+          ls -lah target/release/ || true  
+          echo "✅ RScanner build finished"  
+  
+      - name: Discovery Phase  
+        id: discover  
+        run: |  
+          set -euo pipefail  
+          TMPDIR=$(mktemp -d)  
+          trap 'rm -rf "$TMPDIR"' EXIT  
+  
+          OUT_DIR="${TMPDIR}/out"  
+          mkdir -p "$OUT_DIR"  
+  
+          echo "🔍 Starting discovery phase..."  
+          echo "Targets: ${TARGETS}"  
+  
+          : > "${OUT_DIR}/discovered.txt"  
+  
+          # RScanner  
+          if [ "${USE_RSCANNER}" = "true" ] && [ -x "${SCAN_BINARY}" ]; then  
+            echo "Running RScanner..."  
+            timeout "${SCANNER_TIMEOUT}s" "${SCAN_BINARY}" > "${OUT_DIR}/rscanner.log" 2>&1 || true  
+            grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' "${OUT_DIR}/rscanner.log" | sort -u >> "${OUT_DIR}/discovered.txt" || true  
+          fi  
+  
+          # Masscan  
+          if [ "${USE_MASSCAN}" = "true" ] && command -v masscan &>/dev/null; then  
+            if [ -n "${TARGETS}" ]; then  
+              echo "Running Masscan on ${TARGETS}..."  
+              sudo masscan -p80,443 ${TARGETS} --rate "${MASSCAN_RATE}" -oL "${OUT_DIR}/masscan.out" || true  
+              grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' "${OUT_DIR}/masscan.out" | sort -u >> "${OUT_DIR}/discovered.txt" || true  
+            else  
+              echo "⚠️  SKIP Masscan: TARGETS not set"  
+            fi  
+          else  
+            echo "⚠️ Masscan requested but not available"  
+          fi  
+  
+          # ZMap - note: zmap typically scans one prefix/target at a time  
+          if [ "${USE_ZMAP}" = "true" ] && command -v zmap &>/dev/null; then  
+            if [ -n "${TARGETS}" ]; then  
+              echo "Running ZMap..."  
+              IFS=',' read -ra ADDR <<< "${TARGETS}"  
+              for t in "${ADDR[@]}"; do  
+                safe_name=$(echo "${t}" | tr '/,' '__')  
+                sudo zmap -p 80 "${t}" -B "${ZMAP_BANDWIDTH}" -o "${OUT_DIR}/zmap_${safe_name}.csv" || true  
+                cut -d',' -f1 "${OUT_DIR}/zmap_${safe_name}.csv" 2>/dev/null | sort -u >> "${OUT_DIR}/discovered.txt" || true  
+              done  
+            else  
+              echo "⚠️  SKIP ZMap: TARGETS not set"  
+            fi  
+          else  
+            echo "⚠️ ZMap requested but not available"  
+          fi  
+  
+          sort -u "${OUT_DIR}/discovered.txt" -o "${OUT_DIR}/discovered.txt" || true  
+  
+          DISCOVERED_COUNT=$(wc -l < "${OUT_DIR}/discovered.txt" || echo 0)  
+          echo "✅ Discovered ${DISCOVERED_COUNT} unique IPs"  
+  
+          if [ "$DISCOVERED_COUNT" -eq 0 ]; then  
+            echo "⚠️  No IPs discovered"  
+          fi  
+  
+          mkdir -p "${GITHUB_WORKSPACE}/scan_results"  
+          cp "${OUT_DIR}/discovered.txt" "${GITHUB_WORKSPACE}/scan_results/discovered.txt" || true  
+  
+          echo "discovered_file=${GITHUB_WORKSPACE}/scan_results/discovered.txt" >> "${GITHUB_OUTPUT}"  
+  
+      - name: Run Nmap  
+        if: always()  
+        id: nmap  
+        run: |  
+          set -euo pipefail  
+          DISC="${{ steps.discover.outputs.discovered_file }}"  
+          OUTDIR="${GITHUB_WORKSPACE}/scan_results"  
+          mkdir -p "$OUTDIR"  
+  
+          if [ ! -s "$DISC" ]; then  
+            echo "⚠️  No discovered IPs for Nmap; skipping"  
+            echo "nmap_results=" >> "${GITHUB_OUTPUT}"  
+            exit 0  
+          fi  
+  
+          echo "🔍 Running Nmap service detection..."  
+          nmap -sV -O -Pn -iL "$DISC" -oA "$OUTDIR/nmap_results" || true  
+          echo "✅ Nmap completed"  
+          echo "nmap_results=${OUTDIR}/nmap_results.xml" >> "${GITHUB_OUTPUT}"  
+  
+      - name: Advanced Tests and Scoring  
+        id: advanced  
+        run: |  
+          set -euo pipefail  
+          TMPDIR=$(mktemp -d)  
+          trap 'rm -rf "$TMPDIR"' EXIT  
+  
+          DISC="${{ steps.discover.outputs.discovered_file }}"  
+          METRICS_FILE="${TMPDIR}/${{ env.METRICS_OUTPUT }}"  
+          SCORE_RAW="${TMPDIR}/score_raw.txt"  
+  
+          : > "$METRICS_FILE"  
+          : > "$SCORE_RAW"  
+  
+          if [ ! -s "${DISC}" ]; then  
+            echo "⚠️  No IPs to test"  
+            exit 0  
+          fi  
+  
+          retry_with_backoff() {  
+            local host="$1" port="$2"  
+            local max_retries=5 delay=1 retries=0  
+            while [ $retries -lt $max_retries ]; do  
+              if timeout 1 bash -c "cat < /dev/tcp/${host}/${port} >/dev/null 2>&1"; then  
+                return 0  
+              fi  
+              retries=$((retries+1))  
+              sleep $delay  
+              delay=$((delay*2))  
+            done  
+            return 1  
+          }  
+  
+          measure_tcp_rtt() {  
+            local host="$1" port="$2" attempts="$3"  
+            local best=9999  
+            for i in $(seq 1 "$attempts"); do  
+              if retry_with_backoff "$host" "$port"; then  
+                local start=$(date +%s%3N)  
+                timeout 2 bash -c "exec 3<>/dev/tcp/${host}/${port}" >/dev/null 2>&1 || true  
+                local end=$(date +%s%3N)  
+                local rtt=$((end-start))  
+                if [ "$rtt" -lt "$best" ]; then best=$rtt; fi  
+              fi  
+            done  
+            echo "$best"  
+          }  
+  
+          measure_tls() {  
+            local host="$1" port="$2" tout="$3"  
+            local start=$(date +%s%3N)  
+            if timeout "${tout}s" bash -c "echo | openssl s_client -connect ${host}:${port} -servername ${host} >/dev/null 2>&1"; then  
+              local end=$(date +%s%3N)  
+              echo $((end-start))  
+            else  
+              echo 9999  
+            fi  
+          }  
+  
+          measure_health() {  
+            local proto="$1" host="$2" path="$3" tout="$4"  
+            local out  
+            out=$(timeout "${tout}s" curl --max-time "${tout}" --insecure -sS -w "%{http_code},%{time_total}" -o /dev/null "${proto}://${host}${path}" 2>/dev/null) || out=""  
+            if [ -z "$out" ]; then  
+              printf "0,9999,000"  
+              return 0  
+            fi  
+            local http_code=$(echo "$out" | cut -d',' -f1)  
+            local time_total=$(echo "$out" | cut -d',' -f2)  
+            local ms=$(awk -v t="$time_total" 'BEGIN{printf("%d", t*1000)}')  
+            local health_ok=0  
+            if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 400 ]; then health_ok=1; fi  
+            printf "%d,%s,%03d" "$health_ok" "$ms" "$http_code"  
+          }  
+  
+          measure_single_throughput() {  
+            local proto="$1" host="$2" url="$3" bytes="$4" tout="$5"  
+            local out  
+            out=$(timeout "${tout}s" curl --max-time "${tout}" \  
+              --proxy "${proto}://${host}" \  
+              --insecure -sS -w "%{time_total},%{size_download}" \  
+              -o /dev/null \  
+              "${url}?bytes=${bytes}" 2>/dev/null) || out=""  
+            if [ -z "$out" ]; then echo 0; return 0; fi  
+            local time_total=$(echo "$out" | cut -d',' -f1)  
+            local size_download=$(echo "$out" | cut -d',' -f2)  
+            if awk "BEGIN{exit !($time_total>0 && $size_download==${THROUGHPUT_TEST_BYTES})}"; then  
+              local bps=$(awk -v b="$size_download" -v t="$time_total" 'BEGIN{printf("%d", (b*8)/t)}')  
+              echo "$bps"  
+            else  
+              echo 0  
+            fi  
+          }  
+  
+          measure_stability() {  
+            local host="$1" pings="$2" proto="$3" path="$4" tout="$5"  
+            local succ_ping=0  
+            for i in $(seq 1 "$pings"); do  
+              if timeout 2 ping -c 1 -W 1 "$host" >/dev/null 2>&1; then  
+                succ_ping=$((succ_ping+1))  
+              fi  
+            done  
+            local ping_ratio=$(awk -v s="$succ_ping" -v t="$pings" 'BEGIN{printf("%.2f", (t>0)?s/t:0)}')  
+            local succ_http=0  
+            for i in $(seq 1 "$pings"); do  
+              if timeout "${tout}s" curl --max-time "${tout}" --insecure -sS -o /dev/null -w "%{http_code}" "${proto}://${host}${path}" 2>/dev/null | awk '{exit ($1>=200 && $1<400)?0:1}'; then  
+                succ_http=$((succ_http+1))  
+              fi  
+            done  
+            local http_ratio=$(awk -v s="$succ_http" -v t="$pings" 'BEGIN{printf("%.2f", (t>0)?s/t:0)}')  
+            printf "%s,%s" "$ping_ratio" "$http_ratio"  
+          }  
+  
+          echo "🧪 Starting advanced tests..."  
+          TOTAL_IPS=$(wc -l < "${DISC}")  
+          CURRENT=0  
+  
+          while read -r ip; do  
+            CURRENT=$((CURRENT+1))  
+            echo "Testing IP $CURRENT/$TOTAL_IPS: $ip"  
+  
+            IP_CLEAN="${ip}"  
+            LAT=9999  
+  
+            # Geo  
+            GEO_RAW=$(geoiplookup "$IP_CLEAN" 2>/dev/null || echo "")  
+            GEO=$(echo "$GEO_RAW" | awk -F': ' '{print $2}' | cut -d',' -f1 | tr -d ' ')  
+            [ -z "$GEO" ] && GEO="XX"  
+  
+            # 1) Real ping  
+            REAL_PING=9999  
+            if ping -c "${REAL_PING_TESTS}" -W 1 "$IP_CLEAN" >/tmp/pinglog 2>/dev/null; then  
+              AVG=$(awk -F'/' '/rtt/ {print $5}' /tmp/pinglog | head -1)  
+              if [ -n "$AVG" ]; then  
+                REAL_PING=$(printf "%.0f" "$AVG" 2>/dev/null || echo 9999)  
+              fi  
+            fi  
+  
+            # 2) TCP RTT  
+            TCP_RTT=9999  
+            if [ "${TCP_CONNECT_TESTS}" -gt 0 ]; then  
+              TCP_RTT=$(measure_tcp_rtt "$IP_CLEAN" "${TCP_TEST_PORT}" "${TCP_CONNECT_TESTS}")  
+            fi  
+  
+            # 3) TLS  
+            TLS_MS=9999  
+            TLS_MS=$(measure_tls "$IP_CLEAN" "${TLS_TEST_PORT}" "${TLS_TIMEOUT}")  
+  
+            # 4) Health  
+            HTTP_PROTO="https"  
+            HEALTH_RES=$(measure_health "$HTTP_PROTO" "$IP_CLEAN" "${HEALTH_URL_PATH}" "${HEALTH_HTTP_TIMEOUT}")  
+            HEALTH_OK=$(echo "$HEALTH_RES" | cut -d',' -f1)  
+            HEALTH_LAT_MS=$(echo "$HEALTH_RES" | cut -d',' -f2)  
+            HEALTH_STATUS_CODE=$(echo "$HEALTH_RES" | cut -d',' -f3)  
+  
+            # 5) Throughput  
+            THROUGHPUT_BPS=0  
+            if [ "$HEALTH_OK" -eq 1 ]; then  
+              RAW_BPS_RESULTS="${TMPDIR}/bps_${IP_CLEAN}.txt"  
+              : > "$RAW_BPS_RESULTS"  
+              for i in $(seq 1 "${THROUGHPUT_TEST_COUNT}"); do  
+                bps_run=$(measure_single_throughput "$HTTP_PROTO" "$IP_CLEAN" "${THROUGHPUT_TEST_URL}" "${THROUGHPUT_TEST_BYTES}" "${THROUGHPUT_TIMEOUT}")  
+                echo "$bps_run" >> "$RAW_BPS_RESULTS"  
+              done  
+              MEDIAN_BPS=$(sort -n "$RAW_BPS_RESULTS" | awk '{a[NR]=$1} END{if(NR==0) print 0; else if(NR%2==1) print a[int(NR/2)+1]; else print int((a[NR/2]+a[NR/2+1])/2)}')  
+              THROUGHPUT_BPS=$(printf "%.0f" "$MEDIAN_BPS" 2>/dev/null || echo 0)  
+            fi  
+  
+            # 6) Stability  
+            STAB=$(measure_stability "$IP_CLEAN" 3 "$HTTP_PROTO" "${HEALTH_URL_PATH}" "${HEALTH_HTTP_TIMEOUT}")  
+            PING_RATIO=$(echo "$STAB" | cut -d',' -f1)  
+            HTTP_RATIO=$(echo "$STAB" | cut -d',' -f2)  
+  
+            # Calculate score  
+            RAW_SCORE=$(awk -v w_lat="${W_SCANNER_LATENCY}" -v lat="$LAT" \  
+                          -v w_rp="${W_REAL_PING}" -v rp="$REAL_PING" \  
+                          -v w_tcp="${W_TCP_RTT}" -v tcp="$TCP_RTT" \  
+                          -v w_thr="${W_THROUGHPUT}" -v thr="$THROUGHPUT_BPS" \  
+                          -v w_tls="${W_TLS_HANDSHAKE}" -v tls="$TLS_MS" \  
+                          -v w_health="${W_HEALTH}" -v health_ok="$HEALTH_OK" -v health_lat="$HEALTH_LAT_MS" \  
+                          -v w_stab="${W_STABILITY}" -v ping_ratio="$PING_RATIO" -v http_ratio="$HTTP_RATIO" \  
+                          'BEGIN{  
+                             s_lat = (lat>0 && lat<9999 ? 1000/(lat+1) : 0);  
+                             s_rp  = (rp>0 && rp<9999 ? 1000/(rp+1) : 0);  
+                             s_tcp = (tcp<9999 && tcp>0 ? 1000/(tcp+1) : 0);  
+                             s_thr = (thr>0 ? thr/1024.0 : 0);  
+                             s_tls = (tls<9999 && tls>0 ? 1000/(tls+1) : 0);  
+                             s_health = (health_ok==1 ? (1000/(health_lat+1)) : 0);  
+                             s_stab = ((ping_ratio + http_ratio) / 2.0);  
+                             raw = (w_lat*s_lat) + (w_rp*s_rp) + (w_tcp*s_tcp) + (w_thr*s_thr) + (w_tls*s_tls) + (w_health*s_health) + (w_stab*s_stab);  
+                             printf("%.6f", raw);  
+                          }')  
+  
+            echo "${RAW_SCORE} ${LAT} ${REAL_PING} ${TCP_RTT} ${THROUGHPUT_BPS} ${TLS_MS} ${HEALTH_OK} ${HEALTH_LAT_MS} ${HEALTH_STATUS_CODE} ${PING_RATIO} ${HTTP_RATIO} ${GEO} ${IP_CLEAN}" >> "$SCORE_RAW"  
+  
+            jq -nc --arg ip "$IP_CLEAN" --arg geo "$GEO" \  
+              --argjson lat "$LAT" --argjson realping "$REAL_PING" --argjson tcp "$TCP_RTT" \  
+              --argjson throughput "$THROUGHPUT_BPS" --argjson tls "$TLS_MS" \  
+              --argjson health_ok "$HEALTH_OK" --argjson health_lat "$HEALTH_LAT_MS" \  
+              --argjson health_status "$HEALTH_STATUS_CODE" \  
+              --argjson ping_ratio "$PING_RATIO" --argjson http_ratio "$HTTP_RATIO" \  
+              --argjson raw "$RAW_SCORE" \  
+              '{ip:$ip,geo:$geo,latency:$lat,realping:$realping,tcp_rtt:$tcp,throughput_bps:$throughput,tls_ms:$tls,health_ok:$health_ok,health_latency_ms:$health_lat,health_status:$health_status,ping_ratio:$ping_ratio,http_ratio:$http_ratio,raw_score:$raw}' \  
+              >> "$METRICS_FILE"  
+  
+            if [ "${DEBUG}" = "true" ]; then  
+              echo "  Score: $RAW_SCORE | Ping: $REAL_PING | TCP: $TCP_RTT | Health: $HEALTH_OK | Thr: $THROUGHPUT_BPS"  
+            fi  
+  
+          done < "${DISC}"  
+  
+          mkdir -p "${GITHUB_WORKSPACE}/scan_results"  
+          cp "$METRICS_FILE" "${GITHUB_WORKSPACE}/scan_results/$(basename "$METRICS_FILE")" || true  
+          cp "$SCORE_RAW" "${GITHUB_WORKSPACE}/scan_results/$(basename "$SCORE_RAW")" || true  
+  
+          if [ -s "$METRICS_FILE" ]; then  
+            jq -s 'sort_by(-.raw_score) | .[0:5]' "$METRICS_FILE" > "${GITHUB_WORKSPACE}/${{ env.SUMMARY_OUTPUT }}" || true  
+            echo "✅ Top 5 results saved to summary"  
+          else  
+            echo "⚠️ No metrics generated"  
+          fi  
+  
+      - name: Setup Node (for Wrangler) and Install Wrangler  
+        if: always()  
+        uses: actions/setup-node@v4  
+        with:  
+          node-version: '20'  
+          cache: 'npm'  
+  
+      - name: Install Wrangler CLI  
+        if: always()  
+        run: |  
+          set -euo pipefail  
+          npm install -g wrangler@latest  
+          wrangler --version || { echo "❌ Wrangler installation failed"; exit 1; }  
+          echo "✅ Wrangler installed"  
+  
+      - name: Initialize and Save to Cloudflare D1  
+        if: always()  
+        env:  
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}  
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}  
+          D1_DB_NAME: ${{ secrets.D1_DB_NAME }}  
+        run: |  
+          set -euo pipefail  
+  
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CF_ACCOUNT_ID:-}" ] || [ -z "${D1_DB_NAME:-}" ]; then  
+            echo "❌ Missing required secrets - skipping D1 initialization"  
+            exit 0  
+          fi  
+  
+          cat > create_table.sql <<'EOF'  
+CREATE TABLE IF NOT EXISTS proxy_updates (  
+  id INTEGER PRIMARY KEY AUTOINCREMENT,  
+  ip TEXT NOT NULL,  
+  score REAL NOT NULL,  
+  geo TEXT,  
+  latency INTEGER,  
+  throughput INTEGER,  
+  updated_at TEXT NOT NULL,  
+  UNIQUE(ip, updated_at)  
+);  
+  
+CREATE INDEX IF NOT EXISTS idx_score ON proxy_updates(score DESC);  
+CREATE INDEX IF NOT EXISTS idx_updated_at ON proxy_updates(updated_at DESC);  
+EOF  
+  
+          wrangler d1 execute "${D1_DB_NAME}" --remote --file=create_table.sql 2>&1 | tee schema_output.log || true  
+          if grep -qi "error" schema_output.log || grep -qi "failed" schema_output.log; then  
+            echo "⚠️ Schema creation reported errors/warnings (may already exist)"  
+            tail -n 50 schema_output.log || true  
+          else  
+            echo "✅ Table schema initialized (or already exists)"  
+          fi  
+  
+          SUMMARY_FILE="${GITHUB_WORKSPACE}/${{ env.SUMMARY_OUTPUT }}"  
+          if [ ! -s "$SUMMARY_FILE" ]; then  
+            echo "⚠️  No summary file - skipping data insert"  
+            exit 0  
+          fi  
+  
+          BEST_IP=$(jq -r '.[0].ip // empty' "$SUMMARY_FILE")  
+          BEST_SCORE=$(jq -r '.[0].raw_score // 0' "$SUMMARY_FILE")  
+          BEST_GEO=$(jq -r '.[0].geo // "XX"' "$SUMMARY_FILE")  
+          BEST_PING=$(jq -r '.[0].realping // 9999' "$SUMMARY_FILE")  
+          BEST_THR=$(jq -r '.[0].throughput_bps // 0' "$SUMMARY_FILE")  
+  
+          if [ -z "$BEST_IP" ] || [ "$BEST_IP" = "null" ]; then  
+            echo "⚠️  No valid IP found - skipping insert"  
+            exit 0  
+          fi  
+  
+          cat > insert_data.sql <<EOF  
+INSERT INTO proxy_updates (ip, score, geo, latency, throughput, updated_at)  
+VALUES (  
+  '$(echo "$BEST_IP" | sed "s/'/''/g")',  
+  $BEST_SCORE,  
+  '$(echo "$BEST_GEO" | sed "s/'/''/g")',  
+  $BEST_PING,  
+  $BEST_THR,  
+  datetime('now')  
+);  
+EOF  
+  
+          wrangler d1 execute "${D1_DB_NAME}" --remote --file=insert_data.sql 2>&1 | tee insert_output.log || true  
+          if grep -qi "error" insert_output.log || grep -qi "failed" insert_output.log; then  
+            echo "❌ Data insert reported errors:"  
+            tail -n 50 insert_output.log || true  
+            exit 1  
+          fi  
+  
+          cat > verify.sql <<EOF  
+SELECT * FROM proxy_updates ORDER BY updated_at DESC LIMIT 5;  
+EOF  
+          wrangler d1 execute "${D1_DB_NAME}" --remote --file=verify.sql 2>&1 | tee verify_output.log || true  
+          echo "✅ D1 Database updated (verify output above)"  
+  
+      - name: Upload Artifacts  
+        if: always()  
+        uses: actions/upload-artifact@v4  
+        with:  
+          name: scan-results-${{ github.run_number }}  
+          path: |  
+            scan_results/  
+            *.json  
+            *.log  
+            *.sql  
+          retention-days: 7  
+  
+  cleanup:  
+    name: Cleanup Old Runs  
+    runs-on: ubuntu-latest  
+    needs: smartping  
+    if: always()  
+    permissions:  
+      actions: write  
+      contents: read  
+    steps:  
+      - name: Delete Old Workflow Runs  
+        uses: Mattraks/delete-workflow-runs@v2  
+        with:  
+          token: ${{ secrets.GITHUB_TOKEN }}  
+          repository: ${{ github.repository }}  
+          retain_days: 0  
           keep_minimum_runs: 0
-see@.   
