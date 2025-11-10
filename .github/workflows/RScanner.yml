@@ -17,7 +17,7 @@ on:
         default: 'AUTO'
         type: string
   schedule:
-    - cron: '0 */4 * * *'
+    - cron: '0 * * * *'
 
 concurrency:
   group: rust-proxy-scan-d1-advanced
@@ -775,8 +775,8 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           repository: ${{ github.repository }}
-          retain_days: 7
-          keep_minimum_runs: 10
+          retain_days: 0
+          keep_minimum_runs: 0
 
   database-maintenance:
     name: Database Maintenance & Optimization
