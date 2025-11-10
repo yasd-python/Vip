@@ -689,15 +689,30 @@ jobs:
                    ORDER BY total_score DESC, latency ASC 
                    LIMIT 10"
           
-          RESPONSE=$(curl -s -X POST "$DB_ENDPOINT" \
+          WORK_DIR=$(mktemp -d)
+          trap "rm -rf '$WORK_DIR'" EXIT
+          
+          BODY_FILE="$WORK_DIR/body.json"
+          CODE_FILE="$WORK_DIR/http_code.txt"
+          
+          curl -s -X POST "$DB_ENDPOINT" \
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
             -H "Content-Type: application/json" \
-            --data "$(jq -n --arg sql "$TOP_SQL" '{sql: $sql}')")
+            --data "$(jq -n --arg sql "$TOP_SQL" '{sql: $sql}')" \
+            -o "$BODY_FILE" \
+            -w "%{http_code}" > "$CODE_FILE"
           
-          echo "$RESPONSE" | jq -r '
-            .result[0].results[] | 
-            "[\(.total_score)] \(.ip) | \(.location) | \(.latency)ms | Health:\(.health_score) | Stability:\(.stability)% | \(.scan_timestamp)"
-          ' || echo "Unable to retrieve top performers"
+          HTTP_CODE=$(cat "$CODE_FILE")
+          BODY=$(cat "$BODY_FILE")
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "$BODY" | jq -r '
+              .result[0].results[] | 
+              "[\(.total_score)] \(.ip) | \(.location) | \(.latency)ms | Health:\(.health_score) | Stability:\(.stability)% | \(.scan_timestamp)"
+            ' || echo "Unable to parse top performers"
+          else
+            echo "Unable to retrieve top performers (HTTP $HTTP_CODE)"
+          fi
 
       - name: Upload all artifacts
         if: always()
@@ -801,21 +816,37 @@ jobs:
           API_BASE="https://api.cloudflare.com/client/v4"
           DB_ENDPOINT="${API_BASE}/accounts/${CF_ACCOUNT_ID}/d1/database/${D1_DATABASE_ID}/query"
           
+          WORK_DIR=$(mktemp -d)
+          trap "rm -rf '$WORK_DIR'" EXIT
+          
           execute_query() {
             local sql=$1
             local desc=$2
             
-            RESPONSE=$(curl -s -X POST "$DB_ENDPOINT" \
+            BODY_FILE="$WORK_DIR/body.json"
+            CODE_FILE="$WORK_DIR/http_code.txt"
+            
+            curl -s -X POST "$DB_ENDPOINT" \
               -H "Authorization: Bearer ${CF_API_TOKEN}" \
               -H "Content-Type: application/json" \
-              --data "$(jq -n --arg sql "$sql" '{sql: $sql}')")
+              --data "$(jq -n --arg sql "$sql" '{sql: $sql}')" \
+              -o "$BODY_FILE" \
+              -w "%{http_code}" > "$CODE_FILE"
             
-            SUCCESS=$(echo "$RESPONSE" | jq -r '.success // false')
-            if [ "$SUCCESS" = "true" ]; then
-              echo "✅ $desc"
-              return 0
+            HTTP_CODE=$(cat "$CODE_FILE")
+            BODY=$(cat "$BODY_FILE")
+            
+            if [ "$HTTP_CODE" = "200" ]; then
+              SUCCESS=$(echo "$BODY" | jq -r '.success // false')
+              if [ "$SUCCESS" = "true" ]; then
+                echo "✅ $desc"
+                return 0
+              else
+                echo "WARNING: $desc failed"
+                return 1
+              fi
             else
-              echo "WARNING: $desc failed"
+              echo "ERROR: $desc failed (HTTP $HTTP_CODE)"
               return 1
             fi
           }
@@ -832,12 +863,12 @@ jobs:
             MIN(total_score) as min_score
           FROM proxy_scans"
           
-          STATS=$(curl -s -X POST "$DB_ENDPOINT" \
+          STATS_BODY=$(curl -s -X POST "$DB_ENDPOINT" \
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
             -H "Content-Type: application/json" \
             --data "$(jq -n --arg sql "$ANALYZE_SQL" '{sql: $sql}')")
           
-          echo "$STATS" | jq -r '.result[0].results[0] | 
+          echo "$STATS_BODY" | jq -r '.result[0].results[0] | 
             "Total Records:     \(.total_records)",
             "Unique IPs:        \(.unique_ips)",
             "Unique Locations:  \(.unique_locations)",
