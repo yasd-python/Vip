@@ -460,20 +460,29 @@ jobs:
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
           );'
           
-          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$DB_ENDPOINT" \
+          WORK_DIR=$(mktemp -d)
+          trap "rm -rf '$WORK_DIR'" EXIT
+          
+          BODY_FILE="$WORK_DIR/body.json"
+          CODE_FILE="$WORK_DIR/http_code.txt"
+          
+          curl -s -X POST "$DB_ENDPOINT" \
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
             -H "Content-Type: application/json" \
-            --data "$(jq -n --arg sql "$SCHEMA_SQL" '{sql: $sql}')")
+            --data "$(jq -n --arg sql "$SCHEMA_SQL" '{sql: $sql}')" \
+            -o "$BODY_FILE" \
+            -w "%{http_code}" > "$CODE_FILE"
           
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-          BODY=$(echo "$RESPONSE" | head -n-1)
+          HTTP_CODE=$(cat "$CODE_FILE")
+          BODY=$(cat "$BODY_FILE")
           
           if [ "$HTTP_CODE" = "200" ]; then
             SUCCESS=$(echo "$BODY" | jq -r '.success // false')
             if [ "$SUCCESS" = "true" ]; then
               echo "✅ Database schema initialized successfully"
             else
-              echo "WARNING: Schema response: $BODY"
+              echo "WARNING: Schema response:"
+              echo "$BODY" | jq '.' || echo "$BODY"
               ERRORS=$(echo "$BODY" | jq -r '.errors[]?.message // empty' | head -5)
               if [ -n "$ERRORS" ]; then
                 echo "Errors: $ERRORS"
@@ -514,21 +523,29 @@ jobs:
           TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           RUN_NUM=${{ github.run_number }}
           
+          WORK_DIR=$(mktemp -d)
+          trap "rm -rf '$WORK_DIR'" EXIT
+          
           execute_d1_query() {
             local sql=$1
             local description=$2
             local attempt=0
             
+            BODY_FILE="$WORK_DIR/body.json"
+            CODE_FILE="$WORK_DIR/http_code.txt"
+            
             while [ $attempt -lt $MAX_RETRIES ]; do
               attempt=$((attempt + 1))
               
-              RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$DB_ENDPOINT" \
+              curl -s -X POST "$DB_ENDPOINT" \
                 -H "Authorization: Bearer ${CF_API_TOKEN}" \
                 -H "Content-Type: application/json" \
-                --data "$(jq -n --arg sql "$sql" '{sql: $sql}')")
+                --data "$(jq -n --arg sql "$sql" '{sql: $sql}')" \
+                -o "$BODY_FILE" \
+                -w "%{http_code}" > "$CODE_FILE"
               
-              HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-              BODY=$(echo "$RESPONSE" | head -n-1)
+              HTTP_CODE=$(cat "$CODE_FILE")
+              BODY=$(cat "$BODY_FILE")
               
               if [ "$HTTP_CODE" = "200" ]; then
                 SUCCESS=$(echo "$BODY" | jq -r '.success // false')
@@ -538,10 +555,11 @@ jobs:
                   return 0
                 else
                   echo "WARNING: API returned success=false for: $description"
-                  echo "$BODY" | jq '.'
+                  echo "$BODY" | jq '.' || echo "$BODY"
                 fi
               else
                 echo "WARNING: HTTP $HTTP_CODE for: $description (attempt $attempt/$MAX_RETRIES)"
+                echo "$BODY" | jq '.' || echo "$BODY"
               fi
               
               if [ $attempt -lt $MAX_RETRIES ]; then
