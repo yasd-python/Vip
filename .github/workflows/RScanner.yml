@@ -9,7 +9,7 @@ on:
         description: 'Target IPs/ranges (e.g., "1.1.1.1/24, 8.8.8.8/24"). REQUIRED for Masscan/ZMap if USE_RSCANNER is false.'
         required: false
         default: '' 
-      use_masscan:
+      use_masscan: I 
         description: 'Enable Masscan?'
         required: true
         default: 'true'
@@ -537,85 +537,7 @@ jobs:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           D1_DB_NAME: ${{ secrets.D1_DB_NAME }}
         run: |
-          set -euo pipefail
-
-          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CF_ACCOUNT_ID:-}" ] || [ -z "${D1_DB_NAME:-}" ]; then
-            echo "❌ Missing required secrets - skipping D1 initialization"
-            exit 0
-          fi
-
-          cat > create_table.sql <<'EOF'
-CREATE TABLE IF NOT EXISTS proxy_updates (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ip TEXT NOT NULL,
-  score REAL NOT NULL,
-  geo TEXT,
-  latency INTEGER,
-  throughput INTEGER,
-  updated_at TEXT NOT NULL,
-  UNIQUE(ip, updated_at)
-);
-
-CREATE INDEX IF NOT EXISTS idx_score ON proxy_updates(score DESC);
-CREATE INDEX IF NOT EXISTS idx_updated_at ON proxy_updates(updated_at DESC);
-EOF
-
-          wrangler d1 execute "${D1_DB_NAME}" --remote --file=create_table.sql 2>&1 | tee schema_output.log || true
-          if grep -qi "error" schema_output.log || grep -qi "failed" schema_output.log; then
-            echo "⚠️ Schema creation reported errors/warnings (may already exist)"
-            tail -n 50 schema_output.log || true
-          else
-            echo "✅ Table schema initialized (or already exists)"
-          fi
-
-          SUMMARY_FILE="${GITHUB_WORKSPACE}/${{ env.SUMMARY_OUTPUT }}"
-          if [ ! -s "$SUMMARY_FILE" ]; then
-            echo "⚠️  No summary file - skipping data insert"
-            exit 0
-          fi
-
-          BEST_IP=$(jq -r '.[0].ip // empty' "$SUMMARY_FILE")
-          BEST_SCORE=$(jq -r '.[0].raw_score // 0' "$SUMMARY_FILE")
-          BEST_GEO=$(jq -r '.[0].geo // "XX"' "$SUMMARY_FILE")
-          BEST_PING=$(jq -r '.[0].realping // 9999' "$SUMMARY_FILE")
-          BEST_THR=$(jq -r '.[0].throughput_bps // 0' "$SUMMARY_FILE")
-
-          if [ -z "$BEST_IP" ] || [ "$BEST_IP" = "null" ]; then
-            echo "⚠️  No valid IP found - skipping insert"
-            exit 0
-          fi
-
-          cat > insert_data.sql <<EOF
-INSERT INTO proxy_updates (ip, score, geo, latency, throughput, updated_at)
-VALUES (
-  '$(echo "$BEST_IP" | sed "s/'/''/g")',
-  $BEST_SCORE,
-  '$(echo "$BEST_GEO" | sed "s/'/''/g")',
-  $BEST_PING,
-  $BEST_THR,
-  datetime('now')
-);
-EOF
-
-          wrangler d1 execute "${D1_DB_NAME}" --remote --file=insert_data.sql 2>&1 | tee insert_output.log || true
-          if grep -qi "error" insert_output.log || grep -qi "failed" insert_output.log; then
-            echo "❌ Data insert reported errors:"
-            tail -n 50 insert_output.log || true
-            exit 1
-          fi
-
-          cat > verify.sql <<EOF
-SELECT * FROM proxy_updates ORDER BY updated_at DESC LIMIT 5;
-EOF
-          wrangler d1 execute "${D1_DB_NAME}" --remote --file=verify.sql 2>&1 | tee verify_output.log || true
-          echo "✅ D1 Database updated (verify output above)"
-
-      - name: Upload Artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: scan-results-${{ github.run_number }}
-          path: |
+   path: |
             scan_results/
             *.json
             *.log
@@ -638,3 +560,4 @@ EOF
           repository: ${{ github.repository }}
           retain_days: 0
           keep_minimum_runs: 0
+see@.   
