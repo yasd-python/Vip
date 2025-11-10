@@ -612,6 +612,11 @@ jobs:
           execute_d1_query "$META_SQL" "Insert metadata" || true
           
           echo ""
+          echo "=> Deleting non-current best records (anti-ban)..."
+          DELETE_NON_BEST_SQL="DELETE FROM proxy_scans WHERE is_current_best = 0"
+          execute_d1_query "$DELETE_NON_BEST_SQL" "Delete non-current best records" || true
+          
+          echo ""
           echo "=> Verifying stored data..."
           VERIFY_SQL="SELECT * FROM proxy_scans WHERE id = ${SCAN_ID}"
           VERIFY_RESPONSE=$(execute_d1_query "$VERIFY_SQL" "Verify insertion")
