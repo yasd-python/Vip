@@ -1,4 +1,4 @@
-name: 🌌 Ultimate Quantum-AI Omni-Proxy Evolution System v2.0
+name: 🌌 Ultimate Quantum-AI Omni-Proxy Evolution System v2.1
 
 on:
   workflow_dispatch:
@@ -62,7 +62,7 @@ jobs:
       - name: 🔍 Environment Validation & Setup
         run: |
           echo "🌟 =========================================="
-          echo "🌟 QUANTUM-AI PROXY EVOLUTION SYSTEM v2.0"
+          echo "🌟 QUANTUM-AI PROXY EVOLUTION SYSTEM v2.1"
           echo "🌟 =========================================="
           echo ""
           echo "📊 Configuration Matrix:"
@@ -107,7 +107,6 @@ jobs:
           
           # Massive TCP Stack Expansion
           sudo sysctl -w net.ipv4.tcp_tw_reuse=1
-          sudo sysctl -w net.ipv4.tcp_tw_recycle=0
           sudo sysctl -w net.ipv4.tcp_fin_timeout=15
           sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535"
           sudo sysctl -w net.core.rmem_max=134217728
@@ -719,7 +718,7 @@ jobs:
           
           fn write_detailed_log(data: &[ProxyNode], filename: &str) {
               let mut file = File::create(filename).expect("Cannot create log file");
-              writeln!(file, "=== QUANTUM PROXY SCANNER - DETAILED RESULTS ===\n").unwrap();
+              writeln!(file, "=== QUANTUMPROXY SCANNER - DETAILED RESULTS ===\n").unwrap();
               writeln!(file, "Total Viable Proxies: {}\n", data.len()).unwrap();
               
               for (i, node) in data.iter().enumerate() {
@@ -1078,31 +1077,24 @@ jobs:
           | Metric | Value | Status |
           |:-------|:------|:-------|
           | **Neural Score** | `${{ steps.neural_selection.outputs.best_score }}` | ${{ steps.verification.outputs.performance_grade }} |
-          | **TCP Latency** | `${{ steps.neural_selection.outputs.best_lat }} ms` | ${{ steps.neural_selection.outputs.best_lat < env.OPTIMAL_LATENCY_MS && '🟢 Optimal' || steps.neural_selection.outputs.best_lat < env.MAX_LATENCY_MS && '🟡 Good' || '🔴 High' }} |
-          | **TTFB** | `${{ steps.neural_selection.outputs.best_ttfb }} ms` | ${{ steps.neural_selection.outputs.best_ttfb < env.OPTIMAL_TTFB_MS && '🟢 Optimal' || steps.neural_selection.outputs.best_ttfb < env.MAX_TTFB_MS && '🟡 Good' || '🔴 High' }} |
-          | **Jitter** | `${{ steps.neural_selection.outputs.best_jitter }} ms` | ${{ steps.neural_selection.outputs.best_jitter < 50 && '🟢 Low' || steps.neural_selection.outputs.best_jitter < 100 && '🟡 Moderate' || '🔴 High' }} |
-          | **Stability** | `${{ steps.neural_selection.outputs.best_stability }}%` | ${{ steps.neural_selection.outputs.best_stability >= 90 && '🟢 Excellent' || steps.neural_selection.outputs.best_stability >= 70 && '🟡 Good' || '🔴 Poor' }} |
+          | **TCP Latency** | `${{ steps.neural_selection.outputs.best_lat }} ms` | Performance Indicator |
+          | **TTFB** | `${{ steps.neural_selection.outputs.best_ttfb }} ms` | Response Speed |
+          | **Jitter** | `${{ steps.neural_selection.outputs.best_jitter }} ms` | Stability Metric |
+          | **Stability** | `${{ steps.neural_selection.outputs.best_stability }}%` | Reliability Score |
           | **Location** | `${{ steps.neural_selection.outputs.best_loc }}` | 🌍 |
           
           ### 🎯 Scan Statistics
           
           - **Scan Mode:** `${{ github.event.inputs.scan_mode || 'hybrid_quantum_ultra' }}`
-          - **Targets Evaluated:** `$(wc -l < data/targets.txt)`
+          - **Targets Evaluated:** See logs for details
           - **Viable Candidates:** `${{ steps.neural_selection.outputs.result_count }}`
           - **Memory Nodes Used:** `${{ steps.memory_recall.outputs.memory_count || '0' }}`
-          - **Success Rate:** `$(echo "scale=2; ${{ steps.neural_selection.outputs.result_count }} * 100 / $(wc -l < data/targets.txt)" | bc)%`
           
           ### 🧠 AI Analysis
           
-          This proxy was selected using advanced multi-dimensional neural scoring that evaluates:
+          This proxy was selected using advanced multi-dimensional neural scoring that evaluates TCP connection latency for establishing connections, Time to First Byte for measuring real data transmission speed, network jitter for assessing consistency of response times, and stability scores for determining reliability across multiple tests. The system also incorporates historical performance data from the D1 database to inform its decisions.
           
-          - TCP connection latency (time to establish connection)
-          - Time to First Byte (real data transmission speed)
-          - Network jitter (consistency of response times)
-          - Stability score (reliability across multiple tests)
-          - Historical performance data from D1 database
-          
-          The selection algorithm prioritizes proxies with the optimal balance of speed, stability, and reliability rather than focusing on any single metric.
+          The selection algorithm prioritizes proxies with the optimal balance of speed, stability, and reliability rather than focusing on any single metric. This holistic approach ensures you get a proxy that performs well in real-world usage scenarios.
           
           ### 🔍 Verification Results
           
@@ -1119,7 +1111,7 @@ jobs:
           
           ---
           
-          *Generated by Ultimate Quantum-AI Neural Engine v2.0*  
+          *Generated by Ultimate Quantum-AI Neural Engine v2.1*  
           *Scan Mode: ${{ github.event.inputs.scan_mode || 'hybrid_quantum_ultra' }}*  
           *Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")*
           REPORT_EOF
@@ -1133,11 +1125,11 @@ jobs:
           echo "✅ Comprehensive report generated"
 
       # ================================================================
-      # PHASE 11: ARTIFACT PRESERVATION
+      # PHASE 11: ARTIFACT PRESERVATION (FIXED - Now using v4)
       # ================================================================
       - name: 📦 Archive Results & Artifacts
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: quantum-proxy-results-${{ github.run_number }}
           path: |
@@ -1145,9 +1137,11 @@ jobs:
             results/
             logs/
           retention-days: 30
+          if-no-files-found: warn
+          compression-level: 6
 
       # ================================================================
-      # PHASE 12: SUCCESS NOTIFICATION
+      # PHASE 12: SUCCESS NOTIFICATION & SUMMARY
       # ================================================================
       - name: 🎉 Mission Complete
         if: success()
@@ -1161,6 +1155,9 @@ jobs:
           echo "✅ Champion proxy selected and verified"
           echo "✅ Long-term memory updated"
           echo "✅ Reports generated"
+          echo "✅ Artifacts archived successfully"
           echo ""
           echo "🚀 System ready for next evolution cycle"
+          echo "📊 Run Number: ${{ github.run_number }}"
+          echo "⏰ Completed at: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
           echo ""
