@@ -33,7 +33,7 @@ on:
           - 'lowest_latency'
           - 'highest_throughput'
   schedule:
-    - cron: '0 */3 * * *'  # Runs every 3 hours
+    - cron: '0 */3 * * *'
 
 concurrency:
   group: rust-proxy-scan-intelligent
@@ -83,7 +83,6 @@ jobs:
           
           sudo apt-get update -qq
           
-          # Core packages and advanced network testing tools
           PACKAGES=(
             jq curl netcat-openbsd build-essential pkg-config
             libssl-dev ca-certificates coreutils bc dnsutils
@@ -95,26 +94,22 @@ jobs:
           echo "=> Installing core packages..."
           sudo apt-get install -y "${PACKAGES[@]}" > /dev/null 2>&1
           
-          # Install GeoIP tools for location detection
           if ! command -v geoiplookup &> /dev/null; then
             echo "=> Installing GeoIP tools..."
             sudo apt-get install -y geoip-bin geoip-database geoip-database-extra > /dev/null 2>&1
           fi
           
-          # Install Node.js for advanced speed testing (optional)
           if ! command -v node &> /dev/null; then
             echo "=> Installing Node.js for advanced speed tests..."
             curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash - > /dev/null 2>&1
             sudo apt-get install -y nodejs > /dev/null 2>&1
           fi
           
-          # Install fast-cli for speed testing
           if ! command -v fast &> /dev/null && command -v npm &> /dev/null; then
             echo "=> Installing fast-cli..."
             sudo npm install -g fast-cli 2>/dev/null || echo "⚠️ fast-cli installation skipped (optional)"
           fi
           
-          # Verify critical tools are installed
           REQUIRED_TOOLS=(jq curl bc geoiplookup ping parallel awk wget nc)
           for tool in "${REQUIRED_TOOLS[@]}"; do
             if ! command -v "$tool" &> /dev/null; then
@@ -177,7 +172,6 @@ jobs:
           echo "  🔨 Building RScanner with Maximum Optimizations"
           echo "════════════════════════════════════════════════════════"
           
-          # Set aggressive optimization flags
           export RUSTFLAGS="-C target-cpu=native -C opt-level=3 -C lto=fat -C codegen-units=1"
           BUILD_SUCCESS=false
           
@@ -208,7 +202,6 @@ jobs:
               
               let start = Instant::now();
               
-              // Realistic proxy data with comprehensive metrics
               let proxies = vec![
                   ("185.199.108.13:443", 28, 99.2, 2.1, 850.5, "US"),
                   ("178.128.228.52:443", 35, 98.8, 3.5, 720.3, "DE"),
@@ -231,7 +224,6 @@ jobs:
               println!("   Total proxies discovered: {}", proxies.len());
               println!("   Selection algorithm: Multi-factor optimization\n");
               
-              // Calculate comprehensive scores
               let mut scored_proxies: Vec<_> = proxies.iter().map(|(ip_port, lat, stab, jit, speed, loc)| {
                   let lat_score = calculate_latency_score(*lat);
                   let stab_score = (stab / 4.0) as u32;
@@ -242,7 +234,6 @@ jobs:
                   (ip_port, lat, stab, jit, speed, loc, total_score)
               }).collect();
               
-              // Sort by total score descending, then by latency ascending
               scored_proxies.sort_by(|a, b| {
                   b.6.cmp(&a.6).then_with(|| a.1.cmp(&b.1))
               });
@@ -354,7 +345,6 @@ jobs:
           STRATEGY="${{ github.event.inputs.selection_strategy }}"
           STRATEGY="${STRATEGY:-balanced}"
           
-          # Create secure temporary working directory
           WORK_DIR=$(mktemp -d)
           trap "rm -rf '$WORK_DIR'" EXIT
           
@@ -373,7 +363,6 @@ jobs:
           echo "=> Starting scanner execution..."
           START_TIME=$(date +%s)
           
-          # Execute scanner with timeout protection
           set +e
           timeout "${TIMEOUT}s" "$BIN" > "$RAW_SCAN" 2>&1
           SCAN_EXIT=$?
@@ -390,14 +379,12 @@ jobs:
           echo ""
           echo "=> Parsing results with advanced IP:PORT extraction..."
           
-          # Advanced parsing algorithm that extracts IP:PORT and latency with comprehensive validation
           awk 'BEGIN{IGNORECASE=1}
             /PROXY[[:space:]]+(LIVE|ALIVE|OK|ACTIVE|WORKING|AVAILABLE|HEALTHY)/ {
               line = $0
               latency = 9999
               ip_port = ""
               
-              # Extract latency from various formats: (150 ms), (150ms), (150), 150ms, latency:150
               if (match(line, /\(([[:space:]]*([0-9]+)[[:space:]]*(ms)?[[:space:]]*)\)/, arr)) {
                 latency = arr[2] + 0
               } else if (match(line, /[[:space:]]([0-9]+)[[:space:]]*ms/, arr)) {
@@ -406,11 +393,9 @@ jobs:
                 latency = arr[1] + 0
               }
               
-              # Extract IP:PORT with comprehensive validation
               if (match(line, /([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}):([0-9]+)/, arr)) {
                 ip_port = arr[1] ":" arr[2]
                 
-                # Validate IP octets (0-255)
                 split(arr[1], octets, ".")
                 valid = 1
                 for (i in octets) {
@@ -418,23 +403,19 @@ jobs:
                   if (octet_val < 0 || octet_val > 255) valid = 0
                 }
                 
-                # Validate port (1-65535)
                 port = arr[2] + 0
                 
-                # Only output if all validations pass
                 if (valid && port > 0 && port <= 65535 && latency > 0 && latency < 10000) {
                   print latency, ip_port
                 }
               }
             }' "$RAW_SCAN" > "$LIVE_IPS"
           
-          # Also extract all IP:PORT patterns found anywhere in the log (with default latency)
           awk '{
               while (match($0, /([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}):([0-9]+)/, arr)) {
                 ip_port = arr[1] ":" arr[2]
                 $0 = substr($0, RSTART + RLENGTH)
                 
-                # Validate IP
                 split(arr[1], octets, ".")
                 valid = 1
                 for (i in octets) {
@@ -442,7 +423,6 @@ jobs:
                   if (octet_val < 0 || octet_val > 255) valid = 0
                 }
                 
-                # Validate port
                 port = arr[2] + 0
                 if (valid && port > 0 && port <= 65535) {
                   print 500, ip_port
@@ -450,14 +430,12 @@ jobs:
               }
             }' "$RAW_SCAN" >> "$LIVE_IPS"
           
-          # Remove duplicates, keeping the entry with lowest latency
           sort -n -k1,1 -k2,2 "$LIVE_IPS" | awk '!seen[$2]++' > "$WORK_DIR/unique.txt"
           mv "$WORK_DIR/unique.txt" "$LIVE_IPS"
           
           TOTAL_DISCOVERED=$(wc -l < "$LIVE_IPS")
           echo "   Discovered proxies: $TOTAL_DISCOVERED"
           
-          # Generate synthetic test data if no proxies found
           if [ "$TOTAL_DISCOVERED" -eq 0 ]; then
             echo ""
             echo "⚠️  No proxies discovered, generating synthetic test dataset..."
@@ -486,7 +464,6 @@ jobs:
           echo ""
           echo "=> Applying GeoIP location filtering..."
           
-          # Determine target location (AUTO mode rotates based on run number)
           RUN_NUMBER=${{ github.run_number }}
           TARGET_LOC="${{ github.event.inputs.target_location }}"
           
@@ -500,15 +477,12 @@ jobs:
             echo "   Manual location override: $TARGET_LOC"
           fi
           
-          # Add GeoIP data to each proxy
           : > "$WORK_DIR/target_ips.txt"
           while read -r lat ip_port; do
             IP=$(echo "$ip_port" | cut -d':' -f1)
             
-            # Try multiple GeoIP methods for better accuracy
             GEO=$(geoiplookup "$IP" 2>/dev/null | awk -F': ' '/Country/ {print $2}' | cut -d',' -f1 | tr -d ' ' || echo "XX")
             
-            # If first method fails, try alternative
             if [ "$GEO" = "XX" ] || [ -z "$GEO" ]; then
               GEO=$(curl -s "https://ipapi.co/$IP/country/" 2>/dev/null | head -c 2 || echo "XX")
             fi
@@ -518,7 +492,6 @@ jobs:
           
           mv "$WORK_DIR/target_ips.txt" "$LIVE_IPS"
           
-          # Limit number of proxies to test based on MAX_TEST_PROXIES
           TOTAL_TESTED=$(wc -l < "$LIVE_IPS")
           MAX_TEST="${{ env.MAX_TEST_PROXIES }}"
           
@@ -532,7 +505,6 @@ jobs:
           echo "   Total proxies to test: $TOTAL_TESTED"
           echo ""
           
-          # Define advanced health testing function with comprehensive checks
           test_proxy_health_advanced() {
             local ip_port=$1
             local ip=$(echo "$ip_port" | cut -d':' -f1)
@@ -541,7 +513,6 @@ jobs:
             local details=""
             local is_healthy=0
             
-            # Test 1: ICMP Ping (base connectivity)
             if timeout 2 ping -c 1 -W 1 "$ip" > /dev/null 2>&1; then
               score=$((score + 20))
               details="${details}PING:OK "
@@ -549,7 +520,6 @@ jobs:
               details="${details}PING:FAIL "
             fi
             
-            # Test 2: TCP Port Connectivity (critical test)
             if timeout 3 nc -zv -w 2 "$ip" "$port" > /dev/null 2>&1; then
               score=$((score + 35))
               details="${details}PORT:OK "
@@ -558,7 +528,6 @@ jobs:
               details="${details}PORT:FAIL "
             fi
             
-            # Test 3: Port Priority Scoring (standard proxy ports get bonus)
             case "$port" in
               443)
                 score=$((score + 20))
@@ -578,7 +547,6 @@ jobs:
                 ;;
             esac
             
-            # Test 4: DNS Resolution Speed
             local dns_start=$(date +%s%N)
             if timeout 2 nslookup "$ip" > /dev/null 2>&1; then
               local dns_end=$(date +%s%N)
@@ -596,7 +564,6 @@ jobs:
               fi
             fi
             
-            # Test 5: Network Hop Count (traceroute analysis)
             if [ "$is_healthy" -eq 1 ]; then
               local hop_count=$(timeout 4 traceroute -m 15 -w 1 "$ip" 2>/dev/null | grep -c "^ " || echo "15")
               
@@ -615,7 +582,6 @@ jobs:
             echo "$score|$details|$is_healthy"
           }
           
-          # Calculate stability with multiple test rounds and jitter analysis
           calc_stability_advanced() {
             local ip=$1
             local success=0
@@ -631,7 +597,6 @@ jobs:
               if [ $ping_exit -eq 0 ]; then
                 success=$((success + 1))
                 
-                # Extract latency value
                 local this_lat=$(echo "$ping_output" | grep -oP 'time=\K[0-9.]+' | head -n1)
                 
                 if [ -n "$this_lat" ]; then
@@ -641,19 +606,15 @@ jobs:
                 fi
               fi
               
-              # Small delay between tests
               sleep 0.1
             done
             
-            # Calculate success percentage
             local stability=$(echo "scale=2; ($success * 100) / $total_tests" | bc)
             
-            # Calculate jitter (standard deviation of latency)
             local jitter=0
             if [ "$latency_count" -gt 1 ]; then
               local avg=$(echo "scale=3; $latency_sum / $latency_count" | bc)
               
-              # Calculate variance
               local variance=0
               for lat in $latencies; do
                 local diff=$(echo "scale=3; $lat - $avg" | bc)
@@ -668,25 +629,20 @@ jobs:
             echo "$stability|$jitter"
           }
           
-          # Advanced download speed test through proxy
           test_download_speed() {
             local ip=$1
             local port=$2
             local speed=0
             
-            # Use a reliable test file (1MB for quick testing)
             local test_url="http://ipv4.download.thinkbroadband.com/1MB.zip"
             
-            # Measure download time and calculate speed
             local start_time=$(date +%s%N)
             
-            # Attempt download through proxy with timeout
             local downloaded=$(timeout 8 curl -x "${ip}:${port}" -s -o /dev/null -w "%{size_download}" "$test_url" 2>/dev/null || echo "0")
             
             local end_time=$(date +%s%N)
             local duration_ms=$(( (end_time - start_time) / 1000000 ))
             
-            # Calculate speed in KB/s if download succeeded
             if [ "$downloaded" -gt 0 ] && [ "$duration_ms" -gt 0 ]; then
               local size_kb=$(echo "scale=2; $downloaded / 1024" | bc)
               local duration_sec=$(echo "scale=3; $duration_ms / 1000" | bc)
@@ -696,12 +652,10 @@ jobs:
             echo "$speed"
           }
           
-          # Bandwidth quality test (packet loss and consistency)
           test_bandwidth_quality() {
             local ip=$1
             local packets_sent=10
             
-            # Send multiple packets and analyze results
             local ping_result=$(timeout 5 ping -c $packets_sent -W 1 -i 0.2 "$ip" 2>/dev/null)
             
             if [ -z "$ping_result" ]; then
@@ -709,14 +663,11 @@ jobs:
               return
             fi
             
-            # Extract packet loss percentage
             local packet_loss=$(echo "$ping_result" | grep -oP '\d+(?=% packet loss)' || echo "100")
             
-            # Extract RTT statistics (min/avg/max/mdev)
             local rtt_stats=$(echo "$ping_result" | grep -oP 'rtt min/avg/max/mdev = \K[0-9./]+' || echo "0/0/0/0")
             local avg_rtt=$(echo "$rtt_stats" | cut -d'/' -f2)
             
-            # Calculate quality score (0-100)
             local quality=0
             if [ "$packet_loss" -eq 0 ]; then
               quality=100
@@ -733,13 +684,11 @@ jobs:
             echo "$quality|$packet_loss"
           }
           
-          # Export functions for parallel execution
           export -f test_proxy_health_advanced
           export -f calc_stability_advanced
           export -f test_download_speed
           export -f test_bandwidth_quality
           
-          # Main processing function that combines all metrics
           process_ip_advanced() {
             local lat=$1
             local ip_port=$2
@@ -747,21 +696,17 @@ jobs:
             local ip=$(echo "$ip_port" | cut -d':' -f1)
             local port=$(echo "$ip_port" | cut -d':' -f2)
             
-            # Execute advanced health test
             HEALTH=$(test_proxy_health_advanced "$ip_port")
             HEALTH_SCORE=$(echo "$HEALTH" | cut -d'|' -f1)
             HEALTH_DETAILS=$(echo "$HEALTH" | cut -d'|' -f2)
             IS_HEALTHY=$(echo "$HEALTH" | cut -d'|' -f3)
             
-            # Execute stability test with jitter calculation
             STABILITY_RESULT=$(calc_stability_advanced "$ip")
             STABILITY=$(echo "$STABILITY_RESULT" | cut -d'|' -f1)
             JITTER=$(echo "$STABILITY_RESULT" | cut -d'|' -f2)
             
-            # Convert stability to score component (0-25 points)
             STABILITY_SCORE=$(echo "scale=0; $STABILITY / 4" | bc)
             
-            # Calculate jitter score (lower is better: 0-20 points)
             JITTER_SCORE=0
             if [ "$IS_HEALTHY" = "1" ]; then
               JITTER_NUM=$(echo "$JITTER" | awk '{printf "%.1f", $1}')
@@ -778,16 +723,13 @@ jobs:
               fi
             fi
             
-            # Geographical location scoring (0-30 points)
             LOC_SCORE=0
             if [ "$loc" = "$TARGET_LOC" ]; then
               LOC_SCORE=30
             elif [ "$loc" != "XX" ]; then
-              # Partial score for known location but not target
               LOC_SCORE=15
             fi
             
-            # Latency scoring with weighted importance (0-30 points)
             LAT_SCORE=0
             if [ "$lat" -lt 20 ]; then
               LAT_SCORE=30
@@ -805,7 +747,6 @@ jobs:
               LAT_SCORE=3
             fi
             
-            # Download speed test (optional, can be disabled for faster scanning)
             DOWNLOAD_SPEED=0
             SPEED_SCORE=0
             if [ "$IS_HEALTHY" = "1" ] && [ "${{ env.SPEED_TEST_ENABLED }}" = "true" ]; then
@@ -825,7 +766,6 @@ jobs:
               fi
             fi
             
-            # Bandwidth quality test (packet loss analysis)
             BANDWIDTH_QUALITY=0
             PACKET_LOSS=0
             BW_SCORE=0
@@ -834,14 +774,11 @@ jobs:
               BANDWIDTH_QUALITY=$(echo "$BW_RESULT" | cut -d'|' -f1)
               PACKET_LOSS=$(echo "$BW_RESULT" | cut -d'|' -f2)
               
-              # Score based on bandwidth quality (0-15 points)
               BW_SCORE=$(echo "scale=0; $BANDWIDTH_QUALITY / 7" | bc)
             fi
             
-            # Calculate total score (max 200 points)
             TOTAL=$((LOC_SCORE + HEALTH_SCORE + STABILITY_SCORE + LAT_SCORE + JITTER_SCORE + SPEED_SCORE + BW_SCORE))
             
-            # Generate comprehensive JSON output with all metrics
             jq -n \
               --arg ip_port "$ip_port" \
               --arg loc "$loc" \
@@ -882,7 +819,6 @@ jobs:
           
           : > "$SCORED_RESULTS"
           
-          # Execute parallel processing with progress indication
           echo "Testing $TOTAL_TESTED proxies with ${{ env.PARALLEL_TEST_WORKERS }} parallel workers..."
           
           parallel -j ${{ env.PARALLEL_TEST_WORKERS }} --colsep ' ' \
@@ -892,7 +828,6 @@ jobs:
           echo "Successfully processed: $PROCESSED proxies"
           echo ""
           
-          # Fallback if no results were processed
           if [ "$PROCESSED" -eq 0 ]; then
             echo "⚠️  No proxies passed testing, creating fallback entry..."
             
@@ -929,7 +864,6 @@ jobs:
           echo "════════════════════════════════════════════════════════"
           echo ""
           
-          # Apply selection strategy to find optimal proxy
           case "$STRATEGY" in
             "fastest")
               echo "Strategy: Prioritizing absolute lowest latency for real-time applications"
@@ -957,7 +891,6 @@ jobs:
               ;;
           esac
           
-          # Extract best proxy metrics
           BEST_IP_PORT=$(echo "$BEST" | jq -r '.ip_port')
           BEST_SCORE=$(echo "$BEST" | jq -r '.total_score')
           BEST_LAT=$(echo "$BEST" | jq -r '.latency_ms')
@@ -990,7 +923,6 @@ jobs:
           echo "════════════════════════════════════════════════════════"
           echo ""
           
-          # Select top 10 proxies based on strategy
           case "$STRATEGY" in
             "fastest")
               TOP_10=$(jq -s 'sort_by(.latency_ms, -.download_speed_kbps) | .[0:10]' "$SCORED_RESULTS")
@@ -1009,7 +941,6 @@ jobs:
               ;;
           esac
           
-          # Calculate comprehensive statistics
           HEALTHY_COUNT=$(jq -s '[.[] | select(.is_healthy == 1)] | length' "$SCORED_RESULTS")
           
           if [ "$HEALTHY_COUNT" -gt 0 ]; then
@@ -1036,7 +967,6 @@ jobs:
           echo "   Scan Duration:      ${SCAN_DURATION}s"
           echo ""
           
-          # Save comprehensive metrics to JSON file
           jq -n \
             --arg total "$TOTAL_DISCOVERED" \
             --arg processed "$TOTAL_TESTED" \
@@ -1072,7 +1002,6 @@ jobs:
               top_10_ranking: $top10
             }' > "$METRICS"
           
-          # Export outputs for subsequent workflow steps
           echo "bestipport=$BEST_IP_PORT" >> "$GITHUB_OUTPUT"
           echo "location=$BEST_LOC" >> "$GITHUB_OUTPUT"
           echo "latency=$BEST_LAT" >> "$GITHUB_OUTPUT"
@@ -1108,7 +1037,6 @@ jobs:
           API_BASE="https://api.cloudflare.com/client/v4"
           DB_ENDPOINT="${API_BASE}/accounts/${CF_ACCOUNT_ID}/d1/database/${D1_DATABASE_ID}/query"
           
-          # Comprehensive schema with all advanced metrics
           SCHEMA='CREATE TABLE IF NOT EXISTS proxy_health (
             ip_port TEXT PRIMARY KEY,
             is_healthy INTEGER NOT NULL DEFAULT 0,
@@ -1193,7 +1121,6 @@ jobs:
           CREATE INDEX IF NOT EXISTS idx_incidents_ip ON proxy_incidents(ip_port, occurred_at DESC);
           CREATE INDEX IF NOT EXISTS idx_incidents_severity ON proxy_incidents(severity, occurred_at DESC);'
           
-          # Execute schema creation
           RESULT=$(curl -s -X POST "$DB_ENDPOINT" \
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
             -H "Content-Type: application/json" \
@@ -1245,7 +1172,6 @@ jobs:
           UNIX_TIME=$(date +%s)
           RUN_NUM=${{ github.run_number }}
           
-          # Helper function to execute queries with retry logic and better error handling
           execute_query() {
             local sql=$1
             local desc=$2
@@ -1272,7 +1198,7 @@ jobs:
               ERROR_MSG=$(echo "$RESULT" | jq -r '.errors[0].message // "Unknown error"')
               
               if [ $attempt -lt $max_retries ]; then
-                SLEEP_TIME=$((base_TIME=$((base_sleep * attempt))
+                SLEEP_TIME=$((base_sleep * attempt))
                 echo "   ⚠️  Attempt $attempt failed: $ERROR_MSG"
                 echo "   ⏳ Retrying in ${SLEEP_TIME}s..."
                 sleep $SLEEP_TIME
@@ -1287,14 +1213,12 @@ jobs:
           
           echo "=> Step 1: Upserting proxy health data with comprehensive metrics..."
           
-          # Extract average metrics from the scan results
           AVG_LAT=$(jq -r '.scan_metadata.averages.latency_ms // 0' "${{ env.METRICS_FILE }}")
           AVG_STAB=$(jq -r '.scan_metadata.averages.stability_percent // 0' "${{ env.METRICS_FILE }}")
           AVG_SCORE=$(jq -r '.scan_metadata.averages.total_score // 0' "${{ env.METRICS_FILE }}")
           AVG_JITTER=$(jq -r '.scan_metadata.averages.jitter_ms // 0' "${{ env.METRICS_FILE }}")
           AVG_SPEED=$(jq -r '.scan_metadata.averages.download_speed_kbps // 0' "${{ env.METRICS_FILE }}")
           
-          # This sophisticated upsert query will insert a new proxy record if it doesn't exist, or update the existing one with intelligent logic that tracks both successes and failures over time
           UPSERT_SQL="INSERT INTO proxy_health (
             ip_port, is_healthy, latency_ms, jitter_ms, download_speed_kbps,
             bandwidth_quality, packet_loss_percent, last_check, location,
@@ -1320,7 +1244,7 @@ jobs:
             stability_percent = ${STABILITY},
             total_score = ${SCORE},
             health_details = 'Strategy: ${STRATEGY}',
-            consecutive_failures = CASE WHEN ${IS_HEALTHY} = 1 THEN 0 ELSE consecutive_failures + 1 END,
+            consecutive_failures = CASE WHEN ${IS_HEALTHY} = 1 THEN0 ELSE consecutive_failures + 1 END,
             consecutive_successes = CASE WHEN ${IS_HEALTHY} = 1 THEN consecutive_successes + 1 ELSE 0 END,
             last_success = CASE WHEN ${IS_HEALTHY} = 1 THEN ${UNIX_TIME} ELSE last_success END,
             total_tests = total_tests + 1,
@@ -1331,7 +1255,6 @@ jobs:
           echo ""
           echo "=> Step 2: Recording detailed performance history for trend analysis..."
           
-          # This creates a historical record that allows us to track how proxy performance changes over time, which is invaluable for identifying patterns and predicting future reliability
           PERF_HISTORY_SQL="INSERT INTO proxy_performance_history (
             ip_port, latency_ms, stability_percent, jitter_ms, download_speed_kbps,
             bandwidth_quality, packet_loss_percent, total_score, recorded_at
@@ -1342,7 +1265,6 @@ jobs:
           
           execute_query "$PERF_HISTORY_SQL" "Record performance history" || true
           
-          # If the proxy transitioned from healthy to unhealthy or vice versa, we want to record this as an incident for better tracking of reliability issues
           if [ "${IS_HEALTHY}" = "0" ]; then
             echo ""
             echo "=> Step 3: Recording incident due to unhealthy status..."
@@ -1361,7 +1283,6 @@ jobs:
           echo ""
           echo "=> Step 4: Inserting comprehensive scan metadata..."
           
-          # This captures the complete context of the entire scanning operation, allowing us to analyze trends in overall proxy availability and quality over time
           SCAN_SQL="INSERT INTO proxy_scans (
             scan_timestamp, total_discovered, total_tested, healthy_count,
             scan_duration_seconds, target_location, selection_strategy,
@@ -1381,11 +1302,9 @@ jobs:
           echo ""
           echo "=> Step 5: Retrieving scan ID for reference..."
           
-          # We retrieve the ID of the scan we just inserted so we can reference it in our output and potentially use it for follow-up operations
           LAST_ID_RESULT=$(execute_query "SELECT last_insert_rowid() as id" "Get scan ID" || echo '{"result":[{"results":[{"id":0}]}]}')
           SCAN_ID=$(echo "$LAST_ID_RESULT" | jq -r '.result[0].results[0].id // 0')
           
-          # If we couldn't get a proper scan ID from the database, we'll generate a pseudo-random one for tracking purposes
           if [ "$SCAN_ID" -eq 0 ]; then
             SCAN_ID=$((RUN_NUM * 1000 + RANDOM % 1000))
             echo "   ⚠️  Generated fallback scan ID: $SCAN_ID"
@@ -1394,30 +1313,22 @@ jobs:
           echo ""
           echo "=> Step 6: Performing intelligent cleanup of stale data..."
           
-          # The cleanup strategy uses a multi-tiered approach that considers both the health status and age of proxy records to maintain database efficiency while preserving valuable historical data
-          
-          # First tier: Remove proxies that have failed repeatedly and haven't been checked recently (7 days)
           CUTOFF_TIME=$((UNIX_TIME - 604800))
           execute_query "DELETE FROM proxy_health WHERE consecutive_failures >= 3 AND last_check < ${CUTOFF_TIME}" "Remove repeatedly failed proxies" || true
           
-          # Second tier: Remove very old unhealthy proxies that are unlikely to recover (30 days)
           OLD_CUTOFF=$((UNIX_TIME - 2592000))
           execute_query "DELETE FROM proxy_health WHERE is_healthy = 0 AND last_check < ${OLD_CUTOFF}" "Remove very old unhealthy proxies" || true
           
-          # Third tier: Clean up orphaned performance history records for proxies that no longer exist
           execute_query "DELETE FROM proxy_performance_history WHERE ip_port NOT IN (SELECT ip_port FROM proxy_health)" "Remove orphaned performance records" || true
           
-          # Fourth tier: Maintain a reasonable size for performance history by keeping only the most recent records (last 10000 entries)
           execute_query "DELETE FROM proxy_performance_history WHERE id NOT IN (
             SELECT id FROM proxy_performance_history ORDER BY recorded_at DESC LIMIT 10000
           )" "Cleanup old performance history" || true
           
-          # Fifth tier: Keep scan metadata manageable by retaining only the last 500 scans
           execute_query "DELETE FROM proxy_scans WHERE id NOT IN (
             SELECT id FROM proxy_scans ORDER BY created_at DESC LIMIT 500
           )" "Cleanup old scan records" || true
           
-          # Sixth tier: Keep incident records manageable by retaining only the last 1000 incidents
           execute_query "DELETE FROM proxy_incidents WHERE id NOT IN (
             SELECT id FROM proxy_incidents ORDER BY occurred_at DESC LIMIT 1000
           )" "Cleanup old incident records" || true
@@ -1446,13 +1357,11 @@ jobs:
           echo "    Status:            $([ "$IS_HEALTHY" = "1" ] && echo "HEALTHY ✅" || echo "DEGRADED ⚠️")"
           echo "    Scan ID:           $SCAN_ID"
           echo "    Healthy Proxies:   ${HEALTHY_COUNT}/${TOTAL_TESTED}"
-          echo "    Discovery Rate:    $(echo "scale=1; ($HEALTHY_COUNT * 100) / $TOTAL_TESTED" | bc)%"
           echo "    Duration:          ${SCAN_DURATION}s"
           echo ""
           echo "════════════════════════════════════════════════════════"
           echo ""
           
-          # Export the scan ID for use in subsequent workflow steps
           echo "scan_id=$SCAN_ID" >> "$GITHUB_OUTPUT"
 
       - name: Query and display top performers with advanced metrics
@@ -1474,7 +1383,6 @@ jobs:
           echo "📋 Top 10 Overall Proxies (by total score):"
           echo ""
           
-          # This comprehensive query retrieves the best performing proxies across all metrics, giving us a complete picture of the most reliable options available
           TOP_SQL="SELECT 
             ip_port,
             location,
@@ -1509,7 +1417,6 @@ jobs:
           echo "⚡ Top 5 Fastest Proxies (lowest latency):"
           echo ""
           
-          # For applications that require real-time responsiveness such as gaming or live streaming, latency is the critical factor, so we identify the proxies with the absolute lowest response times
           FASTEST_SQL="SELECT 
             ip_port, location, latency_ms, 
             ROUND(stability_percent, 2) as stability, 
@@ -1531,7 +1438,6 @@ jobs:
           echo "📊 Top 5 Most Stable Proxies (highest stability and lowest jitter):"
           echo ""
           
-          # For applications that need consistent, reliable connections over extended periods, stability and low jitter are paramount, as they indicate the proxy maintains steady performance
           STABLE_SQL="SELECT 
             ip_port, location, 
             ROUND(stability_percent, 2) as stability,
@@ -1556,7 +1462,6 @@ jobs:
           echo "🚀 Top 5 Highest Throughput Proxies (best download speed):"
           echo ""
           
-          # For bulk data transfers, file downloads, or bandwidth-intensive applications, download speed is the key metric that determines overall efficiency
           THROUGHPUT_SQL="SELECT 
             ip_port, location,
             ROUND(download_speed_kbps, 0) as speed_kbps,
@@ -1598,7 +1503,6 @@ jobs:
           echo "📊 Best Proxy Performance History (last 10 measurements):"
           echo ""
           
-          # By examining the historical performance data for our selected proxy, we can identify patterns, detect degradation trends, and predict potential issues before they become critical
           TREND_SQL="SELECT 
             datetime(recorded_at, 'unixepoch') as timestamp,
             latency_ms,
@@ -1625,7 +1529,6 @@ jobs:
           echo "📉 Recent Incidents and Reliability Issues:"
           echo ""
           
-          # Tracking incidents helps us understand failure patterns and identify proxies that may have intermittent issues requiring attention or replacement
           INCIDENTS_SQL="SELECT 
             ip_port,
             incident_type,
@@ -1657,7 +1560,6 @@ jobs:
           echo "📊 Overall System Health Statistics:"
           echo ""
           
-          # These aggregate statistics provide a bird's-eye view of the entire proxy infrastructure, helping us understand overall system health and identify systemic issues or improvements
           STATS_SQL="SELECT 
             COUNT(*) as total_proxies,
             SUM(CASE WHEN is_healthy = 1 THEN 1 ELSE 0 END) as healthy,
@@ -1679,7 +1581,7 @@ jobs:
             --data "$(jq -n --arg sql "$STATS_SQL" '{sql: $sql}')" | \
             jq -r '.result[0].results[0]? | 
               "   Total Proxies in Database:  \(.total_proxies)",
-              "   Healthy Proxies:            \(.healthy) ✅ (\(((.healthy / .total_proxies) * 100) | round)%)",
+              "   Healthy Proxies:            \(.healthy) ✅",
               "   Unhealthy Proxies:          \(.unhealthy) ❌",
               "",
               "   Latency Statistics:",
@@ -1702,7 +1604,6 @@ jobs:
           echo "🌍 Geographic Distribution of Healthy Proxies:"
           echo ""
           
-          # Understanding the geographic distribution helps us ensure we have good coverage across different regions and can select proxies optimally based on user location
           GEO_SQL="SELECT 
             location,
             COUNT(*) as count,
@@ -1726,13 +1627,11 @@ jobs:
           echo "📅 Scan History Summary (last 10 scans):"
           echo ""
           
-          # Reviewing recent scan history allows us to identify trends in proxy availability and quality over time, which can inform infrastructure planning and issue detection
           HISTORY_SQL="SELECT 
             datetime(created_at) as scan_time,
             selection_strategy,
             total_discovered,
             healthy_count,
-            ROUND((healthy_count * 100.0 / total_tested), 2) as success_rate,
             scan_duration_seconds,
             ROUND(avg_latency, 2) as avg_lat,
             ROUND(avg_score, 2) as avg_sc
@@ -1745,7 +1644,7 @@ jobs:
             -H "Content-Type: application/json" \
             --data "$(jq -n --arg sql "$HISTORY_SQL" '{sql: $sql}')" | \
             jq -r '.result[0].results[]? | 
-              "   \(.scan_time) | Strategy:\(.selection_strategy) | Found:\(.total_discovered) | Healthy:\(.healthy_count) (\(.success_rate)%) | Avg Lat:\(.avg_lat)ms | Avg Score:\(.avg_sc)/200 | Duration:\(.scan_duration_seconds)s"' || \
+              "   \(.scan_time) | Strategy:\(.selection_strategy) | Found:\(.total_discovered) | Healthy:\(.healthy_count) | Avg Lat:\(.avg_lat)ms | Avg Score:\(.avg_sc)/200 | Duration:\(.scan_duration_seconds)s"' || \
             echo "   No scan history available"
           
           echo ""
@@ -1761,141 +1660,127 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
+      - name: Prepare summary variables
+        id: prepare_summary
+        run: |
+          # Calculate success rate safely in bash first
+          HEALTHY=${{ steps.scan.outputs.healthy_count }}
+          TESTED=${{ steps.scan.outputs.total_tested }}
+          
+          if [ "$TESTED" -gt 0 ]; then
+            SUCCESS_RATE=$(awk "BEGIN {printf \"%.1f\", ($HEALTHY * 100.0) / $TESTED}")
+          else
+            SUCCESS_RATE="0.0"
+          fi
+          
+          echo "success_rate=$SUCCESS_RATE" >> "$GITHUB_OUTPUT"
+          
+          # Generate performance rating text
+          SCORE=${{ steps.scan.outputs.score }}
+          if [ "$SCORE" -ge 160 ]; then
+            PERF_RATING="⭐⭐⭐⭐⭐ Excellent"
+          elif [ "$SCORE" -ge 120 ]; then
+            PERF_RATING="⭐⭐⭐⭐ Very Good"
+          elif [ "$SCORE" -ge 80 ]; then
+            PERF_RATING="⭐⭐⭐ Good"
+          elif [ "$SCORE" -ge 40 ]; then
+            PERF_RATING="⭐⭐ Fair"
+          else
+            PERF_RATING="⭐ Needs Improvement"
+          fi
+          
+          echo "perf_rating=$PERF_RATING" >> "$GITHUB_OUTPUT"
+          
+          # Generate latency rating
+          LAT=${{ steps.scan.outputs.latency }}
+          if [ "$LAT" -lt 30 ]; then
+            LAT_RATING="⚡⚡⚡ Excellent"
+          elif [ "$LAT" -lt 50 ]; then
+            LAT_RATING="⚡⚡ Very Good"
+          elif [ "$LAT" -lt 100 ]; then
+            LAT_RATING="⚡ Good"
+          else
+            LAT_RATING="⏱️ Acceptable"
+          fi
+          
+          echo "lat_rating=$LAT_RATING" >> "$GITHUB_OUTPUT"
+
       - name: Generate detailed workflow summary
         if: always()
         run: |
-          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
-          # 🚀 Advanced Intelligent Proxy Scanner - Comprehensive Analysis Report
+          cat >> $GITHUB_STEP_SUMMARY << 'SUMMARY_EOF'
+          # Advanced Intelligent Proxy Scanner - Comprehensive Analysis Report
           
-          ## 🏆 Optimal Proxy Selection Results
+          ## Optimal Proxy Selection Results
           
-          This advanced scanning system has analyzed multiple proxies using sophisticated multi-criteria evaluation to identify the most reliable and performant option for your specific use case.
+          This advanced scanning system has analyzed multiple proxies using sophisticated multi-criteria evaluation to identify the most reliable and performant option.
           
           ### Selected Proxy Details
           
-          | Metric | Value | Performance Rating |
-          |--------|-------|-------------------|
-          | **IP:PORT** | `${{ steps.scan.outputs.bestipport }}` | - |
-          | **Geographic Location** | ${{ steps.scan.outputs.location }} 🌍 | - |
-          | **Selection Strategy** | ${{ steps.scan.outputs.strategy }} | 🎯 |
-          | **Total Score** | ${{ steps.scan.outputs.score }}/200 | ${{ steps.scan.outputs.score >= 160 && '⭐⭐⭐⭐⭐ Excellent' || steps.scan.outputs.score >= 120 && '⭐⭐⭐⭐ Very Good' || steps.scan.outputs.score >= 80 && '⭐⭐⭐ Good' || steps.scan.outputs.score >= 40 && '⭐⭐ Fair' || '⭐ Needs Improvement' }} |
-          | **Latency** | ${{ steps.scan.outputs.latency }}ms | ${{ steps.scan.outputs.latency < 30 && '⚡⚡⚡ Excellent' || steps.scan.outputs.latency < 50 && '⚡⚡ Very Good' || steps.scan.outputs.latency < 100 && '⚡ Good' || '⏱️ Acceptable' }} |
-          | **Stability** | ${{ steps.scan.outputs.stability }}% | ${{ steps.scan.outputs.stability >= 99 && '📊📊📊 Excellent' || steps.scan.outputs.stability >= 95 && '📊📊 Very Good' || steps.scan.outputs.stability >= 90 && '📊 Good' || '📉 Fair' }} |
-          | **Jitter** | ${{ steps.scan.outputs.jitter }}ms | ${{ steps.scan.outputs.jitter < 3 && '📈 Excellent' || steps.scan.outputs.jitter < 7 && '📈 Good' || steps.scan.outputs.jitter < 15 && '📈 Fair' || '⚠️ High' }} |
-          | **Download Speed** | ${{ steps.scan.outputs.speed }} KB/s | ${{ steps.scan.outputs.speed > 700 && '🚀🚀🚀 Excellent' || steps.scan.outputs.speed > 400 && '🚀🚀 Very Good' || steps.scan.outputs.speed > 200 && '🚀 Good' || '💾 Moderate' }} |
-          | **Bandwidth Quality** | ${{ steps.scan.outputs.bandwidth }}% | ${{ steps.scan.outputs.bandwidth >= 95 && '🔌 Excellent' || steps.scan.outputs.bandwidth >= 85 && '🔌 Good' || '⚡ Fair' }} |
-          | **Packet Loss** | ${{ steps.scan.outputs.packet_loss }}% | ${{ steps.scan.outputs.packet_loss == 0 && '✅ None' || steps.scan.outputs.packet_loss < 2 && '✅ Minimal' ||steps.scan.outputs.packet_loss < 5 && '⚠️ Low' || '❌ High' }} |
-          | **Health Score** | ${{ steps.scan.outputs.health }}/105 | ${{ steps.scan.outputs.health >= 85 && '💚💚💚 Excellent' || steps.scan.outputs.health >= 65 && '💚💚 Good' || steps.scan.outputs.health >= 45 && '💚 Fair' || '💛 Needs Attention' }} |
-          | **Overall Status** | - | ${{ steps.scan.outputs.is_healthy == 1 && '✅ **HEALTHY AND OPERATIONAL**' || '⚠️ **DEGRADED PERFORMANCE**' }} |
+          **IP:PORT:** `${{ steps.scan.outputs.bestipport }}`
+          
+          **Geographic Location:** ${{ steps.scan.outputs.location }} 🌍
+          
+          **Selection Strategy:** ${{ steps.scan.outputs.strategy }} 🎯
+          
+          **Total Score:** ${{ steps.scan.outputs.score }}/200 (${{ steps.prepare_summary.outputs.perf_rating }})
+          
+          **Latency:** ${{ steps.scan.outputs.latency }}ms (${{ steps.prepare_summary.outputs.lat_rating }})
+          
+          **Stability:** ${{ steps.scan.outputs.stability }}%
+          
+          **Jitter:** ${{ steps.scan.outputs.jitter }}ms
+          
+          **Download Speed:** ${{ steps.scan.outputs.speed }} KB/s
+          
+          **Bandwidth Quality:** ${{ steps.scan.outputs.bandwidth }}%
+          
+          **Packet Loss:** ${{ steps.scan.outputs.packet_loss }}%
+          
+          **Health Score:** ${{ steps.scan.outputs.health }}/105
+          
+          **Overall Status:** ${{ steps.scan.outputs.is_healthy == '1' && '✅ HEALTHY AND OPERATIONAL' || '⚠️ DEGRADED PERFORMANCE' }}
           
           ---
           
-          ## 📊 Comprehensive Scan Statistics
+          ## Comprehensive Scan Statistics
           
-          The scanning process examined a substantial number of proxy servers across multiple geographic locations and evaluated them against rigorous performance criteria to ensure optimal selection.
+          The scanning process examined a substantial number of proxy servers across multiple geographic locations and evaluated them against rigorous performance criteria.
           
-          ### Discovery and Testing Metrics
+          **Total Proxies Discovered:** ${{ steps.scan.outputs.total_discovered }} potential candidates were identified during the initial discovery phase.
           
-          **Total Proxies Discovered:** ${{ steps.scan.outputs.total_discovered }} potential candidates were identified during the initial discovery phase through various proxy sources and scanning techniques.
+          **Proxies Tested:** ${{ steps.scan.outputs.total_tested }} proxies underwent comprehensive multi-criteria testing.
           
-          **Proxies Tested:** ${{ steps.scan.outputs.total_tested }} proxies underwent comprehensive multi-criteria testing including latency measurement, stability analysis, jitter calculation, download speed evaluation, bandwidth quality assessment, and packet loss detection.
+          **Healthy Proxies Found:** ${{ steps.scan.outputs.healthy_count }} proxies successfully passed all health checks, representing a ${{ steps.prepare_summary.outputs.success_rate }}% success rate.
           
-          **Healthy Proxies Found:** ${{ steps.scan.outputs.healthy_count }} proxies successfully passed all health checks and met the minimum performance thresholds, representing a ${{ steps.scan.outputs.healthy_count > 0 && steps.scan.outputs.total_tested > 0 && format('{0:0.1f}', (steps.scan.outputs.healthy_count * 100.0 / steps.scan.outputs.total_tested)) || '0.0' }}% success rate in identifying viable proxy options.
+          **Target Geographic Location:** The scanner was configured to prioritize proxies in the **${{ steps.scan.outputs.target_loc }}** region.
           
-          **Target Geographic Location:** The scanner was configured to prioritize proxies in the **${{ steps.scan.outputs.target_loc }}** region, though proxies from other locations were also evaluated and ranked based on their overall performance characteristics.
+          **Scan Duration:** The complete scanning operation completed in **${{ steps.scan.outputs.scan_duration }} seconds**.
           
-          **Scan Duration:** The complete scanning operation, including discovery, testing, analysis, and database storage, completed in **${{ steps.scan.outputs.scan_duration }} seconds**, demonstrating efficient parallel processing capabilities.
-          
-          **Database Scan ID:** This scan has been recorded in the persistent database with ID **${{ steps.store_d1.outputs.scan_id }}** for historical tracking and trend analysis purposes.
+          **Database Scan ID:** This scan has been recorded with ID **${{ steps.store_d1.outputs.scan_id }}** for historical tracking.
           
           ---
           
-          ## 🎯 Selection Strategy Analysis
+          ## Selection Strategy Analysis
           
-          The **${{ steps.scan.outputs.strategy }}** selection strategy was employed for this scan, which determines how proxies are ranked and prioritized based on specific performance characteristics.
-          
-          ### Strategy Explanations
-          
-          **Balanced Strategy:** This approach considers all performance metrics with equal importance, calculating a comprehensive total score that reflects overall proxy quality across latency, stability, jitter, download speed, bandwidth quality, health checks, and geographic location. This strategy is ideal for general-purpose applications where no single metric dominates the requirements.
-          
-          **Fastest Strategy:** This method prioritizes proxies with the absolute lowest latency combined with high download speeds, making it perfect for real-time applications such as gaming, video streaming, or live data feeds where response time is critical to user experience.
-          
-          **Most Stable Strategy:** This approach focuses on proxies that demonstrate the highest stability percentages and lowest jitter values, making them ideal for long-running connections, automated tasks, or applications that require consistent performance over extended periods without interruption.
-          
-          **Lowest Latency Strategy:** This is the most aggressive speed-focused strategy that selects proxies based purely on their response time, regardless of other factors. It is particularly useful for applications requiring instantaneous responses such as high-frequency trading, real-time gaming, or interactive applications.
-          
-          **Highest Throughput Strategy:** This method optimizes for maximum data transfer rates by prioritizing download speed and bandwidth quality, making it the best choice for bulk data transfers, file downloads, media streaming, or any bandwidth-intensive operations.
+          The **${{ steps.scan.outputs.strategy }}** selection strategy was employed for this scan, which determines how proxies are ranked based on specific performance characteristics. The balanced strategy considers all performance metrics with equal importance and calculates a comprehensive total score. This approach is ideal for general-purpose applications where no single metric dominates the requirements.
           
           ---
           
-          ## 🔍 Performance Metrics Explained
+          ## Performance Metrics Explained
           
-          Each metric measured during the scanning process provides valuable insight into different aspects of proxy performance and reliability.
-          
-          ### Latency (Response Time)
-          
-          Latency measures the time it takes for a request to travel from your system to the proxy server and back, expressed in milliseconds. Lower latency values indicate faster response times and better overall performance. The selected proxy achieved **${{ steps.scan.outputs.latency }}ms** latency, which falls into the ${{ steps.scan.outputs.latency < 30 && 'excellent range for real-time applications' || steps.scan.outputs.latency < 50 && 'very good range suitable for most interactive uses' || steps.scan.outputs.latency < 100 && 'good range acceptable for general browsing and data transfer' || 'acceptable range for non-time-critical operations' }}.
-          
-          ### Stability Percentage
-          
-          Stability reflects the consistency of the proxy connection over multiple test iterations, calculated as the percentage of successful connection attempts. The selected proxy demonstrated **${{ steps.scan.outputs.stability }}%** stability, indicating that ${{ steps.scan.outputs.stability >= 99 && 'virtually all connection attempts succeed, making it highly reliable for critical applications' || steps.scan.outputs.stability >= 95 && 'the vast majority of connections succeed, providing excellent reliability for most use cases' || steps.scan.outputs.stability >= 90 && 'most connections succeed, offering good reliability for general purposes' || 'connection reliability may require monitoring for mission-critical applications' }}.
-          
-          ### Jitter (Latency Variation)
-          
-          Jitter quantifies the variability in latency measurements over time, with lower values indicating more consistent performance. The selected proxy exhibits **${{ steps.scan.outputs.jitter }}ms** jitter, which means ${{ steps.scan.outputs.jitter < 3 && 'extremely consistent performance with minimal variation, ideal for real-time communications and streaming' || steps.scan.outputs.jitter < 7 && 'consistent performance suitable for most interactive applications and media streaming' || steps.scan.outputs.jitter < 15 && 'acceptable variation for general use, though some sensitive applications may notice occasional fluctuations' || 'noticeable variation that may affect real-time applications or video streaming quality' }}.
-          
-          ### Download Speed
-          
-          Download speed measures the data transfer rate through the proxy, expressed in kilobytes per second. The selected proxy achieves **${{ steps.scan.outputs.speed }} KB/s**, which ${{ steps.scan.outputs.speed > 700 && 'represents excellent throughput capable of handling high-bandwidth applications, large file transfers, and high-definition media streaming without bottlenecks' || steps.scan.outputs.speed > 400 && 'provides very good throughput suitable for standard file transfers, media streaming, and most web browsing scenarios' || steps.scan.outputs.speed > 200 && 'offers good throughput adequate for general web browsing, document downloads, and standard definition media' || 'provides moderate throughput suitable for basic web browsing and small file transfers' }}.
-          
-          ### Bandwidth Quality
-          
-          Bandwidth quality is a composite metric that evaluates the consistency and reliability of the connection throughput, factoring in packet loss and transmission stability. The selected proxy scores **${{ steps.scan.outputs.bandwidth }}%** in bandwidth quality, demonstrating ${{ steps.scan.outputs.bandwidth >= 95 && 'exceptional connection quality with minimal packet loss and highly consistent throughput' || steps.scan.outputs.bandwidth >= 85 && 'strong connection quality suitable for most applications including streaming and real-time communications' || steps.scan.outputs.bandwidth >= 75 && 'adequate connection quality for general use, though sensitive applications may experience occasional issues' || 'connection quality that may require monitoring and could benefit from optimization' }}.
-          
-          ### Packet Loss
-          
-          Packet loss measures the percentage of data packets that fail to reach their destination, with lower percentages indicating better connection reliability. The selected proxy experiences **${{ steps.scan.outputs.packet_loss }}%** packet loss, which ${{ steps.scan.outputs.packet_loss == 0 && 'is perfect, with zero data loss ensuring maximum reliability for all applications including VoIP, video conferencing, and streaming' || steps.scan.outputs.packet_loss < 2 && 'is minimal and well within acceptable ranges for all applications, including latency-sensitive real-time communications' || steps.scan.outputs.packet_loss < 5 && 'is low and acceptable for most applications, though some real-time applications may experience minor degradation' || 'is elevated and may cause noticeable issues with real-time applications, streaming, or interactive services' }}.
-          
-          ### Health Score
-          
-          The health score is calculated based on multiple diagnostic tests including ICMP ping responsiveness, TCP port connectivity, DNS resolution speed, network hop count analysis, and port priority assessment. The selected proxy achieved **${{ steps.scan.outputs.health }}/105** points, indicating ${{ steps.scan.outputs.health >= 85 && 'excellent overall health with strong performance across all diagnostic categories' || steps.scan.outputs.health >= 65 && 'good overall health with solid performance in most diagnostic areas' || steps.scan.outputs.health >= 45 && 'fair health status that may benefit from monitoring or could be used for non-critical applications' || 'health concerns that suggest careful evaluation before deployment in production environments' }}.
+          Each metric measured during the scanning process provides valuable insight into different aspects of proxy performance and reliability. The latency measurement shows the time required for requests to travel to the proxy and back. The stability percentage reflects the consistency of the proxy connection over multiple test iterations. Jitter quantifies the variability in latency measurements over time, with lower values indicating more consistent performance. Download speed measures the data transfer rate through the proxy. Bandwidth quality evaluates the consistency and reliability of the connection throughput. Packet loss measures the percentage of data packets that fail to reach their destination. The health score is calculated based on multiple diagnostic tests including connectivity checks and network performance analysis.
           
           ---
           
-          ## 💾 Data Persistence and Historical Tracking
+          ## Data Persistence and Historical Tracking
           
-          All scan results, performance metrics, and proxy health data have been permanently stored in the Cloudflare D1 database for long-term trend analysis, performance monitoring, and historical comparison. This persistent storage enables sophisticated analytics including performance degradation detection, reliability trending, geographic distribution analysis, and predictive maintenance capabilities.
-          
-          The database maintains comprehensive records including individual proxy health status with detailed metrics, complete scan metadata for every workflow execution, historical performance measurements enabling trend analysis, and incident logs tracking reliability issues over time. This historical data foundation supports intelligent decision-making and automated proxy selection optimization.
+          All scan results, performance metrics, and proxy health data have been permanently stored in the Cloudflare D1 database for long-term trend analysis and performance monitoring. This persistent storage enables sophisticated analytics including performance degradation detection, reliability trending, and geographic distribution analysis.
           
           ---
           
-          ## 📈 Next Steps and Recommendations
-          
-          Based on the scan results and performance analysis, consider the following recommendations for optimal proxy utilization.
-          
-          If the selected proxy demonstrates excellent performance with high scores across all metrics, it can be deployed immediately for production workloads with confidence in its reliability and performance characteristics. Regular monitoring should be maintained to detect any performance degradation over time.
-          
-          For applications requiring maximum reliability, consider implementing automatic failover mechanisms that can switch to alternative high-scoring proxies if the primary proxy experiences degradation or becomes unavailable. The top ten proxies identified in this scan provide excellent failover candidates.
-          
-          Regular scanning at the configured three-hour intervals ensures that the proxy pool remains current and that any performance changes or new high-quality proxies are quickly identified and incorporated into the selection pool. This continuous monitoring approach maintains optimal performance over time.
-          
-          The comprehensive metrics stored in the database enable sophisticated analysis of proxy performance patterns, geographic distribution trends, and reliability characteristics that can inform infrastructure planning and optimization strategies for your specific use cases.
-          
-          ---
-          
-          ## 🔗 Additional Resources
-          
-          **Scan Artifacts:** Detailed logs and metrics files have been uploaded as workflow artifacts and are available for download for a period of thirty days, enabling detailed offline analysis and troubleshooting if needed.
-          
-          **Database Access:** Query the D1 database directly using the Cloudflare dashboard or API to access historical data, generate custom reports, or integrate proxy selection into automated systems and applications.
-          
-          **Performance Trends:** Review the performance trend analysis in the workflow logs to understand how the selected proxy has performed over time and identify any emerging patterns or concerns that may require attention.
-          
-          ---
-          
-          *This comprehensive analysis was generated automatically by the Advanced Intelligent Proxy Scanner workflow system, combining sophisticated testing methodologies with intelligent multi-criteria selection algorithms to identify optimal proxy servers for your specific requirements.*
-          EOF
+          *This comprehensive analysis was generated automatically by the Advanced Intelligent Proxy Scanner workflow system.*
+          SUMMARY_EOF
 
       - name: Send notification on workflow completion
         if: always()
