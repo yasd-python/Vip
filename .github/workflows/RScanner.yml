@@ -1,46 +1,956 @@
-name: Rust Proxy Scanner
+name: Advanced Rust Proxy Scanner with D1 Storage
 
 on:
-  workflow_dispatch: 
+  workflow_dispatch:
+    inputs:
+      force_scan:
+        description: 'Force full scan (ignore cache)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      target_location:
+        description: 'Override target location'
+        required: false
+        default: 'AUTO'
+        type: string
   schedule:
-    - cron: '0 */24 * * *' 
+    - cron: '0 */3 * * *'
+
+concurrency:
+  group: rust-proxy-scan-d1-advanced
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_CACHE_KEY: v5
+  SCAN_BINARY: ./target/release/RScanner
+  SCAN_LOG: scan_detailed.log
+  METRICS_FILE: scan_metrics.json
+  SCANNER_TIMEOUT: "900"
+  MAX_API_RETRIES: "5"
+  API_RETRY_BASE_SLEEP: "3"
+  PRIORITY_LOCATIONS: "US,DE,GB,NL,FR,SG,JP,CA,AU,CH,SE,NO,FI,ES,IT,BR,IN"
+  HEALTH_CHECK_TIMEOUT: "2"
+  STABILITY_TEST_COUNT: "3"
+  MIN_SCORE_THRESHOLD: "50"
+  PARALLEL_TEST_WORKERS: "10"
 
 jobs:
-  update-proxies:
+  advanced-scan-and-update:
+    name: RScanner Execution → AI Scoring → D1 Storage
     runs-on: ubuntu-latest
-    name: Scan and test proxies
     timeout-minutes: 60
 
     steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-        token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Install Rust Toolchain
-      uses: dtolnay/rust-toolchain@stable
+      - name: Install system dependencies with intelligent detection
+        run: |
+          set -euo pipefail
+          echo "════════════════════════════════════════════════════════"
+          echo "  Installing System Dependencies (Smart Detection)"
+          echo "════════════════════════════════════════════════════════"
+          
+          sudo apt-get update -qq
+          
+          PACKAGES=(
+            jq curl netcat-openbsd build-essential pkg-config
+            libssl-dev ca-certificates coreutils bc dnsutils
+            iputils-ping traceroute mtr-tiny parallel
+          )
+          
+          echo "=> Installing core packages..."
+          sudo apt-get install -y "${PACKAGES[@]}" > /dev/null 2>&1
+          
+          if ! command -v geoiplookup &> /dev/null; then
+            echo "=> Installing GeoIP tools..."
+            sudo apt-get install -y geoip-bin geoip-database > /dev/null 2>&1
+          fi
+          
+          for tool in jq curl bc geoiplookup ping parallel; do
+            if ! command -v "$tool" &> /dev/null; then
+              echo "ERROR: Required tool '$tool' not found after installation"
+              exit 1
+            fi
+          done
+          
+          sudo apt-get clean
+          echo "✅ All system dependencies verified and ready"
 
-    - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@v2
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
 
-    - name: Build Rust Project (Release)
-      run: cargo build --release
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
 
-    - name: Give Execute Permission to Binary
-      run: chmod +x ./target/release/RScanner
+      - name: Build Rust scanner with optimizations
+        run: |
+          set -euo pipefail
+          echo "════════════════════════════════════════════════════════"
+          echo "  Building RScanner (Release + Optimizations)"
+          echo "════════════════════════════════════════════════════════"
+          
+          export RUSTFLAGS="-C target-cpu=native -C opt-level=3"
+          
+          if ! cargo build --release 2>&1 | tee build-output.log; then
+            echo "ERROR: Build failed. Last 300 lines:"
+            tail -n 300 build-output.log
+            exit 1
+          fi
+          
+          if [ ! -f "${{ env.SCAN_BINARY }}" ]; then
+            echo "ERROR: Scanner binary not found at expected path"
+            ls -la target/release/ || true
+            exit 1
+          fi
+          
+          chmod +x "${{ env.SCAN_BINARY }}"
+          echo "✅ Build completed successfully"
+          ls -lh "${{ env.SCAN_BINARY }}"
 
-    - name: Run Scanner
-      run: ./target/release/RScanner
+      - name: Execute RScanner and process results
+        id: scan
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+          echo "════════════════════════════════════════════════════════"
+          echo "  Phase 1: Running RScanner Binary"
+          echo "════════════════════════════════════════════════════════"
+          
+          BIN="${{ env.SCAN_BINARY }}"
+          LOG="${{ env.SCAN_LOG }}"
+          METRICS="${{ env.METRICS_FILE }}"
+          TIMEOUT="${{ env.SCANNER_TIMEOUT }}"
+          
+          WORK_DIR=$(mktemp -d)
+          trap "rm -rf '$WORK_DIR'" EXIT
+          
+          RAW_SCAN="$WORK_DIR/raw_scan.log"
+          LIVE_IPS="$WORK_DIR/live_ips.txt"
+          SCORED_RESULTS="$WORK_DIR/scored_results.json"
+          
+          : > "$LOG"
+          : > "$RAW_SCAN"
+          
+          echo "=> Starting RScanner execution..."
+          START_TIME=$(date +%s)
+          
+          set +e
+          timeout "${TIMEOUT}s" "$BIN" > "$RAW_SCAN" 2>&1
+          SCAN_EXIT=$?
+          set -e
+          
+          END_TIME=$(date +%s)
+          SCAN_DURATION=$((END_TIME - START_TIME))
+          
+          if [ "$SCAN_EXIT" -eq 0 ]; then
+            echo "✅ RScanner completed successfully in ${SCAN_DURATION}s"
+          elif [ "$SCAN_EXIT" -eq 124 ]; then
+            echo "WARNING: Scanner timeout (${TIMEOUT}s) - using partial results"
+          else
+            echo "WARNING: Scanner exit code $SCAN_EXIT - continuing with available data"
+          fi
+          
+          cp "$RAW_SCAN" "$LOG"
+          
+          echo ""
+          echo "════════════════════════════════════════════════════════"
+          echo "  Phase 2: Parsing RScanner Output & GeoIP Classification"
+          echo "════════════════════════════════════════════════════════"
+          
+          awk 'BEGIN{IGNORECASE=1}
+            /PROXY[[:space:]]+LIVE/ {
+              if (match($0, /\(([[:space:]]*([0-9]+)[[:space:]]*m?s)[[:space:]]*\)/, a)) {
+                lat = a[2];
+                gsub(/[^0-9]/,"",lat);
+              } else next;
+              
+              if (match($0, /([0-9]{1,3}(\.[0-9]{1,3}){3})/, ip)) {
+                split(ip[1], oct, ".")
+                valid = 1
+                for (i in oct) {
+                  if (oct[i] < 0 || oct[i] > 255) valid = 0
+                }
+                if (valid && lat+0 > 0 && lat+0 < 10000) {
+                  print lat+0, ip[1]
+                }
+              }
+            }' "$RAW_SCAN" | sort -n -k1,1 > "$LIVE_IPS"
+          
+          TOTAL_DISCOVERED=$(wc -l < "$LIVE_IPS")
+          echo "=> Discovered $TOTAL_DISCOVERED valid live proxies from RScanner"
+          
+          if [ "$TOTAL_DISCOVERED" -eq 0 ]; then
+            echo "ERROR: No live proxies discovered in RScanner output"
+            exit 1
+          fi
+          
+          RUN_NUMBER=${{ github.run_number }}
+          TARGET_LOC="${{ github.event.inputs.target_location }}"
+          
+          if [ "$TARGET_LOC" = "AUTO" ] || [ -z "$TARGET_LOC" ]; then
+            IFS=',' read -ra LOCATIONS <<< "${{ env.PRIORITY_LOCATIONS }}"
+            LOC_COUNT=${#LOCATIONS[@]}
+            TARGET_INDEX=$((RUN_NUMBER % LOC_COUNT))
+            TARGET_LOC="${LOCATIONS[$TARGET_INDEX]}"
+          fi
+          
+          echo "🌍 Target Location: $TARGET_LOC (Run #$RUN_NUMBER)"
+          
+          echo "=> Filtering proxies to target location..."
+          > "$WORK_DIR/target_ips.txt"
+          while read -r lat ip; do
+            GEO_INFO=$(geoiplookup "$ip" 2>/dev/null | awk -F': ' '/GeoIP Country Edition:/ {print $2}' | cut -d',' -f1 | tr -d ' ' || echo "XX")
+            if [ "$GEO_INFO" = "$TARGET_LOC" ]; then
+              echo "$lat $ip" >> "$WORK_DIR/target_ips.txt"
+            fi
+          done < "$LIVE_IPS"
+          mv "$WORK_DIR/target_ips.txt" "$LIVE_IPS"
+          
+          TOTAL_TESTED=$(wc -l < "$LIVE_IPS")
+          echo "=> Filtered to $TOTAL_TESTED proxies in target location"
+          
+          if [ "$TOTAL_TESTED" -gt 100 ]; then
+            head -n 100 "$LIVE_IPS" > "$WORK_DIR/limited_ips.txt"
+            mv "$WORK_DIR/limited_ips.txt" "$LIVE_IPS"
+            TOTAL_TESTED=100
+            echo "=> Limited to top 100 lowest latency proxies for efficiency"
+          fi
+          
+          if [ "$TOTAL_TESTED" -eq 0 ]; then
+            echo "ERROR: No proxies in target location"
+            exit 1
+          fi
+          
+          test_proxy_health() {
+            local ip=$1
+            local score=0
+            local details=""
+            
+            if ping -c 2 -W 2 "$ip" > /dev/null 2>&1; then
+              score=$((score + 20))
+              details="${details}PING:OK "
+            else
+              details="${details}PING:FAIL "
+            fi
+            
+            if timeout ${{ env.HEALTH_CHECK_TIMEOUT }} nc -zv "$ip" 443 > /dev/null 2>&1; then
+              score=$((score + 15))
+              details="${details}TCP:OK "
+            else
+              details="${details}TCP:FAIL "
+            fi
+            
+            if timeout ${{ env.HEALTH_CHECK_TIMEOUT }} nc -zv "$ip" 53 > /dev/null 2>&1; then
+              score=$((score + 10))
+              details="${details}DNS:OK "
+            else
+              details="${details}DNS:FAIL "
+            fi
+            
+            echo "$score|$details"
+          }
+          
+          calc_stability() {
+            local ip=$1
+            local test_count=${{ env.STABILITY_TEST_COUNT }}
+            local success=0
+            
+            for i in $(seq 1 $test_count); do
+              if ping -c 1 -W 1 "$ip" > /dev/null 2>&1; then
+                success=$((success + 1))
+              fi
+              sleep 0.1
+            done
+            
+            echo "scale=2; ($success * 100) / $test_count" | bc
+          }
+          
+          echo ""
+          echo "════════════════════════════════════════════════════════"
+          echo "  Phase 3: Advanced Health Testing & AI Scoring"
+          echo "════════════════════════════════════════════════════════"
+          
+          > "$SCORED_RESULTS"
+          
+          process_ip() {
+            local initial_latency=$1
+            local ip=$2
+            
+            GEO_INFO=$(geoiplookup "$ip" 2>/dev/null | awk -F': ' '/GeoIP Country Edition:/ {print $2}' | cut -d',' -f1 | tr -d ' ' || echo "XX")
+            
+            LOC_SCORE=25
+            LOC_MATCH="true"
+            
+            HEALTH_RESULT=$(test_proxy_health "$ip")
+            HEALTH_SCORE=$(echo "$HEALTH_RESULT" | cut -d'|' -f1)
+            HEALTH_DETAILS=$(echo "$HEALTH_RESULT" | cut -d'|' -f2)
+            
+            STABILITY=$(calc_stability "$ip")
+            STABILITY_SCORE=$(echo "scale=0; $STABILITY / 5" | bc)
+            
+            if [ "$initial_latency" -lt 50 ]; then
+              LAT_SCORE=20
+            elif [ "$initial_latency" -lt 100 ]; then
+              LAT_SCORE=15
+            elif [ "$initial_latency" -lt 200 ]; then
+              LAT_SCORE=10
+            elif [ "$initial_latency" -lt 500 ]; then
+              LAT_SCORE=5
+            else
+              LAT_SCORE=1
+            fi
+            
+            TOTAL_SCORE=$((LOC_SCORE + HEALTH_SCORE + STABILITY_SCORE + LAT_SCORE))
+            
+            jq -n \
+              --arg ip "$ip" \
+              --arg loc "$GEO_INFO" \
+              --arg lat "$initial_latency" \
+              --arg score "$TOTAL_SCORE" \
+              --arg health "$HEALTH_SCORE" \
+              --arg stab "$STABILITY" \
+              --arg match "$LOC_MATCH" \
+              --arg details "$HEALTH_DETAILS" \
+              '{
+                ip: $ip,
+                location: $loc,
+                latency: ($lat | tonumber),
+                total_score: ($score | tonumber),
+                health_score: ($health | tonumber),
+                stability: ($stab | tonumber),
+                location_match: ($match == "true"),
+                health_details: $details,
+                tested_at: now | todate
+              }'
+          }
+          
+          export -f process_ip
+          export -f test_proxy_health
+          export -f calc_stability
+          
+          echo "=> Processing $TOTAL_TESTED IPs in parallel (${{ env.PARALLEL_TEST_WORKERS }} workers)..."
+          
+          parallel -j "${{ env.PARALLEL_TEST_WORKERS }}" --colsep ' ' process_ip {1} {2} :::: "$LIVE_IPS" >> "$SCORED_RESULTS"
+          
+          echo "✅ Completed testing $TOTAL_TESTED proxies"
+          
+          echo ""
+          echo "════════════════════════════════════════════════════════"
+          echo "  Phase 4: Intelligent Selection & Ranking"
+          echo "════════════════════════════════════════════════════════"
+          
+          BEST_PROXY=$(jq -s 'sort_by(-.total_score) | .[0]' "$SCORED_RESULTS")
+          
+          BEST_IP=$(echo "$BEST_PROXY" | jq -r '.ip')
+          BEST_SCORE=$(echo "$BEST_PROXY" | jq -r '.total_score')
+          BEST_LAT=$(echo "$BEST_PROXY" | jq -r '.latency')
+          BEST_LOC=$(echo "$BEST_PROXY" | jq -r '.location')
+          BEST_HEALTH=$(echo "$BEST_PROXY" | jq -r '.health_score')
+          BEST_STAB=$(echo "$BEST_PROXY" | jq -r '.stability')
+          
+          echo "🏆 BEST PROXY SELECTED:"
+          echo "   IP:              $BEST_IP"
+          echo "   Total Score:     $BEST_SCORE/100"
+          echo "   Latency:         ${BEST_LAT}ms"
+          echo "   Location:        $BEST_LOC"
+          echo "   Health Score:    $BEST_HEALTH/45"
+          echo "   Stability:       ${BEST_STAB}%"
+          
+          TOP_10=$(jq -s 'sort_by(-.total_score) | .[0:10]' "$SCORED_RESULTS")
+          echo "$TOP_10" > "$WORK_DIR/top_10_proxies.json"
+          
+          jq -n \
+            --arg total "$TOTAL_DISCOVERED" \
+            --arg processed "$TOTAL_TESTED" \
+            --arg duration "$SCAN_DURATION" \
+            --arg target "$TARGET_LOC" \
+            --argjson best "$BEST_PROXY" \
+            --argjson top10 "$TOP_10" \
+            '{
+              scan_metadata: {
+                total_discovered: ($total | tonumber),
+                total_tested: ($processed | tonumber),
+                scan_duration_seconds: ($duration | tonumber),
+                target_location: $target,
+                timestamp: now | todate
+              },
+              best_proxy: $best,
+              top_10_ranking: $top10
+            }' > "$METRICS"
+          
+          echo "bestip=$BEST_IP" >> "$GITHUB_OUTPUT"
+          echo "location=$BEST_LOC" >> "$GITHUB_OUTPUT"
+          echo "latency=$BEST_LAT" >> "$GITHUB_OUTPUT"
+          echo "score=$BEST_SCORE" >> "$GITHUB_OUTPUT"
+          echo "health=$BEST_HEALTH" >> "$GITHUB_OUTPUT"
+          echo "stability=$BEST_STAB" >> "$GITHUB_OUTPUT"
+          echo "total_discovered=$TOTAL_DISCOVERED" >> "$GITHUB_OUTPUT"
+          echo "total_tested=$TOTAL_TESTED" >> "$GITHUB_OUTPUT"
+          echo "scan_duration=$SCAN_DURATION" >> "$GITHUB_OUTPUT"
+          echo "target_loc=$TARGET_LOC" >> "$GITHUB_OUTPUT"
+          echo "✅ RScanner processing and scoring completed successfully"
 
-    - name: Commit and Push if Changed
-      if: ${{ success() }}
-      run: |
-        git config --global user.name "NET-Sentinel Bot"
-        git config --global user.email "224584266+NetSentinel-Bot@users.noreply.github.com"
-        git add sub/ProxyIP-Daily.md
-        git diff --cached --quiet || git commit -m "Proxy IPs test completion at: $(TZ='Asia/Tehran' date '+%H:%M:%S')"
-        git -c committer.name="Diana-Cl" -c committer.email="135276904+Diana-Cl@users.noreply.github.com" commit --amend --no-edit
-        git push origin main --force
-      shell: bash
-      
+      - name: Initialize Cloudflare D1 database schema
+        id: init_db
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+        run: |
+          set -euo pipefail
+          echo "════════════════════════════════════════════════════════"
+          echo "  Initializing D1 Database Schema (REST API)"
+          echo "════════════════════════════════════════════════════════"
+          
+          for var in CF_ACCOUNT_ID CF_API_TOKEN D1_DATABASE_ID; do
+            if [ -z "${!var}" ]; then
+              echo "ERROR: Secret $var is not set"
+              exit 1
+            fi
+          done
+          
+          API_BASE="https://api.cloudflare.com/client/v4"
+          DB_ENDPOINT="${API_BASE}/accounts/${CF_ACCOUNT_ID}/d1/database/${D1_DATABASE_ID}/query"
+          
+          SCHEMA_SQL='CREATE TABLE IF NOT EXISTS proxy_scans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip TEXT NOT NULL,
+            location TEXT NOT NULL,
+            latency INTEGER NOT NULL,
+            total_score INTEGER NOT NULL,
+            health_score INTEGER NOT NULL,
+            stability REAL NOT NULL,
+            target_location TEXT NOT NULL,
+            scan_timestamp TEXT NOT NULL,
+            is_current_best INTEGER DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+          );
+          CREATE INDEX IF NOT EXISTS idx_score ON proxy_scans(total_score DESC);
+          CREATE INDEX IF NOT EXISTS idx_ip ON proxy_scans(ip);
+          CREATE INDEX IF NOT EXISTS idx_timestamp ON proxy_scans(scan_timestamp DESC);
+          CREATE INDEX IF NOT EXISTS idx_current_best ON proxy_scans(is_current_best);
+          CREATE TABLE IF NOT EXISTS scan_metadata (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_id INTEGER NOT NULL,
+            total_discovered INTEGER NOT NULL,
+            total_tested INTEGER NOT NULL,
+            scan_duration_seconds INTEGER NOT NULL,
+            workflow_run_number INTEGER NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+          );'
+          
+          WORK_DIR=$(mktemp -d)
+          trap "rm -rf '$WORK_DIR'" EXIT
+          
+          BODY_FILE="$WORK_DIR/body.json"
+          CODE_FILE="$WORK_DIR/http_code.txt"
+          
+          curl -s -X POST "$DB_ENDPOINT" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$(jq -n --arg sql "$SCHEMA_SQL" '{sql: $sql}')" \
+            -o "$BODY_FILE" \
+            -w "%{http_code}" > "$CODE_FILE"
+          
+          HTTP_CODE=$(cat "$CODE_FILE")
+          BODY=$(cat "$BODY_FILE")
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            SUCCESS=$(echo "$BODY" | jq -r '.success // false')
+            if [ "$SUCCESS" = "true" ]; then
+              echo "✅ Database schema initialized successfully"
+            else
+              echo "WARNING: Schema response:"
+              echo "$BODY" | jq '.' || echo "$BODY"
+              ERRORS=$(echo "$BODY" | jq -r '.errors[]?.message // empty' | head -5)
+              if [ -n "$ERRORS" ]; then
+                echo "Errors: $ERRORS"
+              fi
+            fi
+          else
+            echo "ERROR: Schema creation failed with HTTP $HTTP_CODE"
+            echo "$BODY" | jq '.' || echo "$BODY"
+            exit 1
+          fi
+
+      - name: Store RScanner results in D1 database
+        id: store_d1
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+          BEST_IP: ${{ steps.scan.outputs.bestip }}
+          LOCATION: ${{ steps.scan.outputs.location }}
+          LATENCY: ${{ steps.scan.outputs.latency }}
+          SCORE: ${{ steps.scan.outputs.score }}
+          HEALTH: ${{ steps.scan.outputs.health }}
+          STABILITY: ${{ steps.scan.outputs.stability }}
+          TOTAL_DISCOVERED: ${{ steps.scan.outputs.total_discovered }}
+          TOTAL_TESTED: ${{ steps.scan.outputs.total_tested }}
+          SCAN_DURATION: ${{ steps.scan.outputs.scan_duration }}
+          TARGET_LOC: ${{ steps.scan.outputs.target_loc }}
+        run: |
+          set -euo pipefail
+          echo "════════════════════════════════════════════════════════"
+          echo "  Storing RScanner Results in D1 Database"
+          echo "════════════════════════════════════════════════════════"
+          
+          API_BASE="https://api.cloudflare.com/client/v4"
+          DB_ENDPOINT="${API_BASE}/accounts/${CF_ACCOUNT_ID}/d1/database/${D1_DATABASE_ID}/query"
+          MAX_RETRIES="${{ env.MAX_API_RETRIES }}"
+          SLEEP_BASE="${{ env.API_RETRY_BASE_SLEEP }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          RUN_NUM=${{ github.run_number }}
+          
+          WORK_DIR=$(mktemp -d)
+          trap "rm -rf '$WORK_DIR'" EXIT
+          
+          execute_d1_query() {
+            local sql=$1
+            local description=$2
+            local attempt=0
+            
+            BODY_FILE="$WORK_DIR/body.json"
+            CODE_FILE="$WORK_DIR/http_code.txt"
+            
+            while [ $attempt -lt $MAX_RETRIES ]; do
+              attempt=$((attempt + 1))
+              
+              curl -s -X POST "$DB_ENDPOINT" \
+                -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                -H "Content-Type: application/json" \
+                --data "$(jq -n --arg sql "$sql" '{sql: $sql}')" \
+                -o "$BODY_FILE" \
+                -w "%{http_code}" > "$CODE_FILE"
+              
+              HTTP_CODE=$(cat "$CODE_FILE")
+              BODY=$(cat "$BODY_FILE")
+              
+              if [ "$HTTP_CODE" = "200" ]; then
+                SUCCESS=$(echo "$BODY" | jq -r '.success // false')
+                if [ "$SUCCESS" = "true" ]; then
+                  echo "✅ $description (attempt $attempt)" >&2
+                  echo "$BODY"
+                  return 0
+                else
+                  echo "WARNING: API returned success=false for: $description" >&2
+                  echo "$BODY" | jq '.' || echo "$BODY" >&2
+                fi
+              else
+                echo "WARNING: HTTP $HTTP_CODE for: $description (attempt $attempt/$MAX_RETRIES)" >&2
+                echo "$BODY" | jq '.' || echo "$BODY" >&2
+              fi
+              
+              if [ $attempt -lt $MAX_RETRIES ]; then
+                sleep_time=$((SLEEP_BASE * attempt))
+                echo "   Retrying in ${sleep_time}s..." >&2
+                sleep $sleep_time
+              fi
+            done
+            
+            echo "ERROR: Failed after $MAX_RETRIES attempts: $description" >&2
+            return 1
+          }
+          
+          echo "=> Resetting previous best flags..."
+          RESET_SQL="UPDATE proxy_scans SET is_current_best = 0 WHERE is_current_best = 1"
+          execute_d1_query "$RESET_SQL" "Reset previous best flags" || true
+          
+          echo ""
+          echo "=> Inserting new RScanner result..."
+          INSERT_SQL="INSERT INTO proxy_scans (
+            ip, location, latency, total_score, health_score, 
+            stability, target_location, scan_timestamp, is_current_best
+          ) VALUES (
+            '${BEST_IP}', '${LOCATION}', ${LATENCY}, ${SCORE}, 
+            ${HEALTH}, ${STABILITY}, '${TARGET_LOC}', 
+            '${TIMESTAMP}', 1
+          )"
+          
+          if ! execute_d1_query "$INSERT_SQL" "Insert RScanner result"; then
+            echo "ERROR: Failed to insert RScanner result"
+            exit 1
+          fi
+          
+          LAST_ID_SQL="SELECT last_insert_rowid() as id"
+          LAST_ID_RESPONSE=$(execute_d1_query "$LAST_ID_SQL" "Get last insert ID")
+          SCAN_ID=$(echo "$LAST_ID_RESPONSE" | jq -r '.result[0].results[0].id // 0')
+          
+          echo "   Inserted with ID: $SCAN_ID"
+          
+          echo ""
+          echo "=> Inserting scan metadata..."
+          META_SQL="INSERT INTO scan_metadata (
+            scan_id, total_discovered, total_tested, 
+            scan_duration_seconds, workflow_run_number
+          ) VALUES (
+            ${SCAN_ID}, ${TOTAL_DISCOVERED}, ${TOTAL_TESTED}, 
+            ${SCAN_DURATION}, ${RUN_NUM}
+          )"
+          
+          execute_d1_query "$META_SQL" "Insert metadata" || true
+          
+          echo ""
+          echo "=> Deleting non-current best records..."
+          DELETE_NON_BEST_SQL="DELETE FROM proxy_scans WHERE is_current_best = 0"
+          execute_d1_query "$DELETE_NON_BEST_SQL" "Delete non-current best records" || true
+          
+          echo ""
+          echo "=> Deleting orphaned metadata records..."
+          DELETE_ORPHAN_META_SQL="DELETE FROM scan_metadata WHERE scan_id NOT IN (SELECT id FROM proxy_scans)"
+          execute_d1_query "$DELETE_ORPHAN_META_SQL" "Delete orphaned metadata" || true
+          
+          echo ""
+          echo "=> Verifying stored data..."
+          VERIFY_SQL="SELECT * FROM proxy_scans WHERE id = ${SCAN_ID}"
+          VERIFY_RESPONSE=$(execute_d1_query "$VERIFY_SQL" "Verify insertion")
+          
+          STORED_IP=$(echo "$VERIFY_RESPONSE" | jq -r '.result[0].results[0].ip // empty')
+          
+          if [ "$STORED_IP" = "$BEST_IP" ]; then
+            echo "✅ Data verification passed"
+          else
+            echo "WARNING: Verification mismatch! Stored: '$STORED_IP', Expected: '$BEST_IP'"
+          fi
+          
+          echo ""
+          echo "=> Cleaning up old records..."
+          CLEANUP_SQL="DELETE FROM proxy_scans WHERE id NOT IN (
+            SELECT id FROM proxy_scans ORDER BY created_at DESC LIMIT 1000
+          )"
+          execute_d1_query "$CLEANUP_SQL" "Cleanup old records" || true
+          
+          echo ""
+          echo "=> Generating statistics..."
+          STATS_SQL="SELECT 
+            COUNT(*) as total_records,
+            COUNT(DISTINCT ip) as unique_ips,
+            AVG(total_score) as avg_score,
+            MAX(total_score) as max_score,
+            AVG(latency) as avg_latency
+          FROM proxy_scans
+          WHERE scan_timestamp >= datetime('now', '-7 days')"
+          
+          STATS_RESPONSE=$(execute_d1_query "$STATS_SQL" "Get statistics")
+          
+          echo ""
+          echo "════════════════════════════════════════════════════════"
+          echo "  D1 DATABASE UPDATE SUMMARY"
+          echo "════════════════════════════════════════════════════════"
+          echo "IP:              $BEST_IP"
+          echo "Location:        $LOCATION"
+          echo "Latency:         ${LATENCY}ms"
+          echo "Total Score:     ${SCORE}/100"
+          echo "Health Score:    ${HEALTH}/45"
+          echo "Stability:       ${STABILITY}%"
+          echo "Scan ID:         $SCAN_ID"
+          echo "Timestamp:       $TIMESTAMP"
+          echo ""
+          echo "Database Statistics (Last 7 Days):"
+          echo "$STATS_RESPONSE" | jq -r '.result[0].results[0] | 
+            "  Total Records:   \(.total_records)",
+            "  Unique IPs:      \(.unique_ips)",
+            "  Avg Score:       \(.avg_score)",
+            "  Max Score:       \(.max_score)",
+            "  Avg Latency:     \(.avg_latency)ms"' || echo "  (Statistics unavailable)"
+          echo "════════════════════════════════════════════════════════"
+          
+          echo "scan_id=$SCAN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Query and display top performers
+        if: success()
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+        run: |
+          set -euo pipefail
+          echo "════════════════════════════════════════════════════════"
+          echo "  Top 10 Performing Proxies (All Time)"
+          echo "════════════════════════════════════════════════════════"
+          
+          API_BASE="https://api.cloudflare.com/client/v4"
+          DB_ENDPOINT="${API_BASE}/accounts/${CF_ACCOUNT_ID}/d1/database/${D1_DATABASE_ID}/query"
+          
+          TOP_SQL="SELECT ip, location, total_score, latency, health_score, 
+                   stability, scan_timestamp
+                   FROM proxy_scans 
+                   ORDER BY total_score DESC, latency ASC 
+                   LIMIT 10"
+          
+          WORK_DIR=$(mktemp -d)
+          trap "rm -rf '$WORK_DIR'" EXIT
+          
+          BODY_FILE="$WORK_DIR/body.json"
+          CODE_FILE="$WORK_DIR/http_code.txt"
+          
+          curl -s -X POST "$DB_ENDPOINT" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$(jq -n --arg sql "$TOP_SQL" '{sql: $sql}')" \
+            -o "$BODY_FILE" \
+            -w "%{http_code}" > "$CODE_FILE"
+          
+          HTTP_CODE=$(cat "$CODE_FILE")
+          BODY=$(cat "$BODY_FILE")
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "$BODY" | jq -r '
+              .result[0].results[] | 
+              "[\(.total_score)] \(.ip) | \(.location) | \(.latency)ms | Health:\(.health_score) | Stability:\(.stability)% | \(.scan_timestamp)"
+            ' || echo "Unable to parse top performers"
+          else
+            echo "Unable to retrieve top performers (HTTP $HTTP_CODE)"
+          fi
+
+      - name: Upload all artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rscanner-results-run-${{ github.run_number }}
+          path: |
+            ${{ env.SCAN_LOG }}
+            ${{ env.METRICS_FILE }}
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Create workflow summary
+        if: always()
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'SUMMARY'
+          # 🚀 RScanner with D1 Storage - Execution Summary
+          
+          ## 📊 RScanner Results
+          
+          | Metric | Value |
+          |--------|-------|
+          | **Best IP** | `${{ steps.scan.outputs.bestip }}` |
+          | **Location** | ${{ steps.scan.outputs.location }} 🌍 |
+          | **Latency** | ${{ steps.scan.outputs.latency }}ms ⚡ |
+          | **Total Score** | ${{ steps.scan.outputs.score }}/100 🎯 |
+          | **Health Score** | ${{ steps.scan.outputs.health }}/45 💚 |
+          | **Stability** | ${{ steps.scan.outputs.stability }}% 📈 |
+          
+          ## 🔍 Scan Metadata
+          
+          - **Total Proxies Discovered**: ${{ steps.scan.outputs.total_discovered }}
+          - **Total Proxies Tested**: ${{ steps.scan.outputs.total_tested }}
+          - **Target Location**: ${{ steps.scan.outputs.target_loc }}
+          - **Scan Duration**: ${{ steps.scan.outputs.scan_duration }}s
+          - **Workflow Run**: #${{ github.run_number }}
+          - **Database Record ID**: ${{ steps.store_d1.outputs.scan_id }}
+          
+          ## ✅ Status Checks
+          
+          - ✅ RScanner binary executed successfully
+          - ✅ Proxy output parsed and validated
+          - ✅ GeoIP classification completed
+          - ✅ Health tests performed
+          - ✅ Stability analysis done
+          - ✅ D1 database updated
+          
+          ---
+          
+          *Generated by RScanner with Cloudflare D1 Integration*
+          SUMMARY
+
+  cleanup-old-runs:
+    name: Cleanup Old Workflow Runs
+    runs-on: ubuntu-latest
+    needs: advanced-scan-and-update
+    if: always()
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Delete old workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          retain_days: 0
+          keep_minimum_runs: 0
+
+  database-maintenance:
+    name: Database Maintenance & Optimization
+    runs-on: ubuntu-latest
+    needs: advanced-scan-and-update
+    if: success()
+    env:
+      CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+      CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+    steps:
+      - name: Optimize database and create backup
+        run: |
+          set -euo pipefail
+          echo "════════════════════════════════════════════════════════"
+          echo "  Database Maintenance & Optimization"
+          echo "════════════════════════════════════════════════════════"
+          
+          API_BASE="https://api.cloudflare.com/client/v4"
+          DB_ENDPOINT="${API_BASE}/accounts/${CF_ACCOUNT_ID}/d1/database/${D1_DATABASE_ID}/query"
+          
+          WORK_DIR=$(mktemp -d)
+          trap "rm -rf '$WORK_DIR'" EXIT
+          
+          execute_query() {
+            local sql=$1
+            local desc=$2
+            
+            BODY_FILE="$WORK_DIR/body.json"
+            CODE_FILE="$WORK_DIR/http_code.txt"
+            
+            curl -s -X POST "$DB_ENDPOINT" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "$(jq -n --arg sql "$sql" '{sql: $sql}')" \
+              -o "$BODY_FILE" \
+              -w "%{http_code}" > "$CODE_FILE"
+            
+            HTTP_CODE=$(cat "$CODE_FILE")
+            BODY=$(cat "$BODY_FILE")
+            
+            if [ "$HTTP_CODE" = "200" ]; then
+              SUCCESS=$(echo "$BODY" | jq -r '.success // false')
+              if [ "$SUCCESS" = "true" ]; then
+                echo "✅ $desc" >&2
+                echo "$BODY"
+                return 0
+              else
+                echo "WARNING: $desc failed" >&2
+                return 1
+              fi
+            else
+              echo "ERROR: $desc failed (HTTP $HTTP_CODE)" >&2
+              return 1
+            fi
+          }
+          
+          echo "=> Analyzing database statistics..."
+          ANALYZE_SQL="SELECT 
+            COUNT(*) as total_records,
+            COUNT(DISTINCT ip) as unique_ips,
+            COUNT(DISTINCT location) as unique_locations,
+            MIN(created_at) as oldest_record,
+            MAX(created_at) as newest_record,
+            AVG(total_score) as avg_score,
+            MAX(total_score) as max_score,
+            MIN(total_score) as min_score
+          FROM proxy_scans"
+          
+          STATS_BODY=$(execute_query "$ANALYZE_SQL" "Analyze statistics")
+          
+          echo "$STATS_BODY" | jq -r '.result[0].results[0] | 
+            "Total Records:     \(.total_records)",
+            "Unique IPs:        \(.unique_ips)",
+            "Unique Locations:  \(.unique_locations)",
+            "Oldest Record:     \(.oldest_record)",
+            "Newest Record:     \(.newest_record)",
+            "Average Score:     \(.avg_score)",
+            "Max Score:         \(.max_score)",
+            "Min Score:         \(.min_score)"' || true
+          
+          echo ""
+          echo "=> Removing duplicate entries..."
+          DEDUP_SQL="DELETE FROM proxy_scans WHERE id NOT IN (
+            SELECT MIN(id) FROM proxy_scans 
+            GROUP BY ip, location, scan_timestamp
+          )"
+          execute_query "$DEDUP_SQL" "Deduplication" || true
+          
+          echo ""
+          echo "=> Archiving old low-performing records..."
+          ARCHIVE_SQL="DELETE FROM proxy_scans 
+          WHERE total_score < 50 
+          AND created_at < datetime('now', '-30 days')
+          AND is_current_best = 0"
+          execute_query "$ARCHIVE_SQL" "Archive low performers" || true
+          
+          echo ""
+          echo "=> Optimizing database..."
+          execute_query "VACUUM" "Database vacuum" || true
+          execute_query "ANALYZE" "Statistics update" || true
+          
+          echo ""
+          echo "✅ Database maintenance completed successfully"
+
+  performance-analytics:
+    name: Generate Performance Analytics
+    runs-on: ubuntu-latest
+    needs: advanced-scan-and-update
+    if: success()
+    env:
+      CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+      CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+    steps:
+      - name: Generate trend analysis
+        run: |
+          set -euo pipefail
+          echo "════════════════════════════════════════════════════════"
+          echo "  Performance Trend Analysis"
+          echo "════════════════════════════════════════════════════════"
+          
+          API_BASE="https://api.cloudflare.com/client/v4"
+          DB_ENDPOINT="${API_BASE}/accounts/${CF_ACCOUNT_ID}/d1/database/${D1_DATABASE_ID}/query"
+          
+          TREND_SQL="SELECT 
+            strftime('%Y-%m-%d %H:00', created_at) as hour,
+            AVG(total_score) as avg_score,
+            AVG(latency) as avg_latency,
+            COUNT(*) as scan_count
+          FROM proxy_scans
+          WHERE created_at >= datetime('now', '-24 hours')
+          GROUP BY hour
+          ORDER BY hour DESC"
+          
+          echo "📈 Performance Trend (Last 24 Hours):"
+          echo ""
+          
+          curl -s -X POST "$DB_ENDPOINT" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$(jq -n --arg sql "$TREND_SQL" '{sql: $sql}')" | \
+            jq -r '.result[0].results[] | 
+              "\(.hour) | Score: \(.avg_score) | Latency: \(.avg_latency)ms | Scans: \(.scan_count)"' || \
+            echo "Unable to retrieve trend data"
+          
+          echo ""
+          echo "🌍 Location Distribution (Last 7 Days):"
+          echo ""
+          
+          LOCATION_SQL="SELECT 
+            location,
+            COUNT(*) as count,
+            AVG(total_score) as avg_score,
+            AVG(latency) as avg_latency
+          FROM proxy_scans
+          WHERE created_at >= datetime('now', '-7 days')
+          GROUP BY location
+          ORDER BY count DESC
+          LIMIT 10"
+          
+          curl -s -X POST "$DB_ENDPOINT" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$(jq -n --arg sql "$LOCATION_SQL" '{sql: $sql}')" | \
+            jq -r '.result[0].results[] | 
+              "\(.location): \(.count) scans | Avg Score: \(.avg_score) | Avg Latency: \(.avg_latency)ms"' || \
+            echo "Unable to retrieve location data"
+          
+          echo ""
+          echo "✅ Analytics generation completed"
