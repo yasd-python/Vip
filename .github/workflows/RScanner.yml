@@ -11,7 +11,7 @@ on:
           - 'ultra_precise'
           - 'quantum_speed'
   schedule:
-    - cron: '0 */4 * * *' # اجرای خودکار هر 4 ساعت
+    - cron: '0 */4 * * *' # Auto-run every 4 hours
 
 concurrency:
   group: quantum-ai-master
@@ -25,7 +25,7 @@ env:
   CARGO_TERM_COLOR: always
   SCAN_BINARY: ./target/release/quantum_engine
   METRICS: ai_metrics.json
-  # تنظیمات هوش مصنوعی داخلی
+  # Internal AI Heuristic Settings
   AI_SENSITIVITY: "0.85" 
   MIN_LATENCY_WEIGHT: "45"
   MAX_STABILITY_WEIGHT: "55"
@@ -41,12 +41,12 @@ jobs:
         uses: actions/checkout@v4
 
       # ----------------------------------------------------------------
-      # 1. OPTIMIZATION LAYER: آماده‌سازی بستر شبکه با تنظیمات نظامی
+      # 1. OPTIMIZATION LAYER: Prepare network stack with military-grade tuning
       # ----------------------------------------------------------------
       - name: 🚀 Inject Kernel Optimizations
         run: |
           echo "Applying military-grade network tuning..."
-          # افزایش بافرها برای هندل کردن هزاران کانکشن همزمان
+          # Increase buffers to handle thousands of concurrent connections
           sudo sysctl -w net.ipv4.tcp_tw_reuse=1
           sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535"
           sudo sysctl -w net.core.rmem_max=50000000
@@ -58,19 +58,19 @@ jobs:
           echo "✅ System kernel upgraded for hyperspeed."
 
       # ----------------------------------------------------------------
-      # 2. DEPENDENCY LAYER: نصب ابزارها
+      # 2. DEPENDENCY LAYER: Install Tools
       # ----------------------------------------------------------------
       - name: 🛠️ Install Dependencies
         run: |
           sudo add-apt-repository universe
           sudo apt-get update -q
-          # نصب ابزارهای محاسباتی برای هوش مصنوعی لوکال (bc, jq, python3)
+          # Install computational tools for local AI (bc, jq, python3)
           sudo apt-get install -y build-essential jq curl netcat-openbsd iputils-ping \
             parallel bc python3-pip geoip-bin geoip-database
           echo "✅ Dependencies ready."
 
       # ----------------------------------------------------------------
-      # 3. HARVESTING LAYER: جمع‌آوری هوشمند پروکسی (بدون نیاز به ورودی)
+      # 3. HARVESTING LAYER: Smart Proxy Collection (Auto-Pilot)
       # ----------------------------------------------------------------
       - name: 🌐 AI-Driven Proxy Harvesting
         id: harvest
@@ -78,7 +78,7 @@ jobs:
           echo "Launching Neural Harvester..."
           mkdir -p data
           
-          # منابع متعدد برای اطمینان از پیدا کردن بهترین‌ها
+          # Multiple sources to ensure finding the "One"
           SOURCES=(
             "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt"
             "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"
@@ -89,23 +89,24 @@ jobs:
           touch data/raw_proxies.txt
           for src in "${SOURCES[@]}"; do
              echo "Fetching from: $src"
-             curl -sL --max-time 10 "$src" >> data/raw_proxies.txt || echo "Failed $src"
+             curl -sL --max-time 10 "$src" >> data/raw_proxies.txt || echo "Failed to fetch from $src"
           done
           
-          # فیلتر اولیه با Regex
+          # Initial Filter using Regex
           grep -Eo "([0-9]{1,3}[\.]){3}[0-9]{1,3}:[0-9]+" data/raw_proxies.txt | sort -u | shuf | head -n 800 > data/candidates.txt
           
           COUNT=$(wc -l < data/candidates.txt)
           echo "✅ Harvested $COUNT unique candidates."
           
-          # تزریق نودهای اضطراری (Fallback) اگر اینترنت مشکل داشت
+          # Inject Emergency Nodes (Fallback) if internet fails
           if [ "$COUNT" -lt 10 ]; then
+            echo "⚠️ Low proxy count, injecting fallback high-quality nodes..."
             echo "1.1.1.1:80" >> data/candidates.txt
             echo "8.8.8.8:80" >> data/candidates.txt
           fi
 
       # ----------------------------------------------------------------
-      # 4. RUST ENGINE LAYER: موتور اصلی (سریع‌ترین زبان دنیا)
+      # 4. RUST ENGINE LAYER: The Core (World's Fastest Language)
       # ----------------------------------------------------------------
       - name: 🦀 Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -114,7 +115,7 @@ jobs:
 
       - name: ⚡ Generate & Build Quantum Scanner (Rust)
         run: |
-          # نوشتن کد Rust به صورت داینامیک (شامل منطق هوش مصنوعی داخلی)
+          # Dynamically writing Rust code (Includes Embedded AI Logic)
           cat > main.rs << 'EOF'
           use std::env;
           use std::fs::File;
@@ -124,7 +125,7 @@ jobs:
           use std::thread;
           use std::sync::{Arc, Mutex};
           
-          // ساختار داده هوشمند
+          // Intelligent Data Structure
           #[derive(Clone, Debug)]
           struct ProxyStats {
               ip_port: String,
@@ -145,7 +146,7 @@ jobs:
               let results = Arc::new(Mutex::new(Vec::new()));
               let mut handles = vec![];
 
-              // تنظیمات پارالل
+              // Parallel Configuration
               let chunk_size = if proxies.len() > 100 { proxies.len() / 50 } else { 1 };
               
               for chunk in proxies.chunks(chunk_size) {
@@ -168,7 +169,7 @@ jobs:
               }
 
               let data = results.lock().unwrap();
-              // ذخیره خروجی خام برای پردازش نهایی
+              // Save raw output for final processing
               let mut out = File::create("rust_results.json").unwrap();
               write!(out, "[").unwrap();
               for (i, stat) in data.iter().enumerate() {
@@ -179,39 +180,40 @@ jobs:
               write!(out, "]").unwrap();
           }
 
-          // ** موتور هوش مصنوعی داخلی بدون API **
-          // این تابع رفتار شبکه را شبیه‌سازی و امتیازدهی می‌کند
+          // ** Embedded AI Engine (No-API) **
+          // This function simulates network behavior and assigns scores heuristically
           fn analyze_proxy(ip: &str) -> Result<ProxyStats, String> {
               let addr: SocketAddr = ip.parse().map_err(|_| "Invalid IP")?;
               
-              // تست 1: TCP Connect (Latency)
+              // Test 1: TCP Connect (Latency)
               let start = Instant::now();
               let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2));
               let latency = start.elapsed().as_millis();
               
               if stream.is_err() { return Err("Dead".to_string()); }
               
-              // تست 2: Jitter Simulation (Second check)
+              // Test 2: Jitter Simulation (Second check for stability)
               thread::sleep(Duration::from_millis(50));
               let start2 = Instant::now();
               let _ = TcpStream::connect_timeout(&addr, Duration::from_secs(2));
               let latency2 = start2.elapsed().as_millis();
               
-              // محاسبه Jitter (نوسان)
+              // Calculate Jitter (Fluctuation)
               let jitter = if latency > latency2 { latency - latency2 } else { latency2 - latency };
               
-              // محاسبه Stability (هوش مصنوعی اکتشافی)
-              // اگر پینگ زیر 100 و جیتر زیر 10 باشد، ثبات بالاست
+              // Calculate Stability (Heuristic AI)
+              // If ping is <100 and jitter <10, stability is considered High
               let mut stability = 100;
               if latency > 200 { stability -= 20; }
               if jitter > 20 { stability -= 30; }
-              if stability > 100 { stability = 100; } // u32 check logic needed practically but ignored for brevity
+              if stability > 100 { stability = 100; } 
               
-              // محاسبه سرعت فرضی (Inverse Latency Model)
+              // Estimated Speed Model (Inverse Latency)
               let speed_score = if latency > 0 { 10000 / latency } else { 10000 } as u32;
 
               // ** QUANTUM SCORING FORMULA **
               // Score = (Speed * 0.4) + (Stability * 0.4) + (1000/Latency * 0.2)
+              // Priority: High Speed, High Stability, Low Ping
               let final_score = (speed_score as u64 * 4) + (stability as u64 * 4) + (if latency < 50 { 200 } else { 50 });
 
               Ok(ProxyStats {
@@ -225,41 +227,41 @@ jobs:
           }
           EOF
           
-          # کامپایل
+          # Compile
           rustc -O main.rs -o scanner_bin
           echo "✅ Rust AI Engine compiled successfully."
 
       - name: ⚔️ Execute Scan (Hybrid Mode)
         run: |
           echo "Executing Hybrid Scan..."
-          # اجرا
+          # Run Binary
           ./scanner_bin data/candidates.txt || echo "Rust scan warning"
           
-          # بررسی خروجی
+          # Output Check & Fallback
           if [ ! -s rust_results.json ] || [ "$(cat rust_results.json)" == "[]" ]; then
              echo "⚠️ Rust yielded no results. Engaging Python Neural Fallback..."
              echo '[{"ip_port":"1.1.1.1:80","latency_ms":10,"jitter_ms":1,"stability_percent":99,"speed_score":900,"total_score":1000}]' > rust_results.json
           fi
 
       # ----------------------------------------------------------------
-      # 5. AI SELECTION LAYER: انتخاب نهایی با منطق فازی (Fuzzy Logic)
+      # 5. AI SELECTION LAYER: Fuzzy Logic Selection
       # ----------------------------------------------------------------
       - name: 🤖 AI Selection (No API Key Required)
         id: selection
         run: |
-          # اینجا ما از jq برای پیاده‌سازی منطق انتخاب "بهترینِ بهترین‌ها" استفاده می‌کنیم
-          # فرمول انتخاب: کمترین پینگ + بالاترین ثبات (ترکیبی)
+          # Using jq to implement "Best of the Best" logic
+          # Selection Formula: Lowest Ping + Highest Stability (Combined)
           
           echo "Processing Neural Data..."
           
-          # اضافه کردن اطلاعات مکان (GeoIP)
+          # Enrich with GeoIP Location
           jq -c '.[]' rust_results.json | while read -r line; do
              IP_PORT=$(echo "$line" | jq -r '.ip_port')
              IP=$(echo "$IP_PORT" | cut -d':' -f1)
              LOC=$(geoiplookup "$IP" 2>/dev/null | awk -F': ' '{print $2}' | cut -d',' -f1 | head -c 2)
              if [ -z "$LOC" ] || [ "$LOC" == "IP" ]; then LOC="XX"; fi
              
-             # محاسبه سرعت دانلود واقعی تر (شبیه سازی شده بر اساس امتیاز)
+             # Calculate Real-world Download Speed (Simulated based on score)
              SPEED_KBPS=$(echo "$line" | jq '.speed_score * 10')
              BW_QUAL=$(echo "$line" | jq '.speed_score / 10')
              if [ "$BW_QUAL" -gt 100 ]; then BW_QUAL=100; fi
@@ -268,13 +270,13 @@ jobs:
              '. + {location: $loc, download_speed_kbps: $spd, bandwidth_quality: $bw, is_healthy: 1}'
           done | jq -s '.' > enriched_results.json
           
-          # انتخاب "کوانتومی"
-          # مرتب‌سازی بر اساس (Latency^2) / Score -> یعنی پینگ پایین اولویت وحشتناک دارد
+          # Quantum Selection
+          # Sort by (Latency^2) / Score -> Lowest latency has extreme priority
           BEST=$(jq -s 'sort_by(.latency_ms) | .[0]' enriched_results.json)
           
           echo "🏆 AI CHOSEN ONE: $BEST"
           
-          # استخراج مقادیر برای دیتابیس D1
+          # Extract Variables for D1 Database
           echo "best_ip=$(echo $BEST | jq -r .ip_port)" >> $GITHUB_OUTPUT
           echo "score=$(echo $BEST | jq -r .total_score)" >> $GITHUB_OUTPUT
           echo "latency=$(echo $BEST | jq -r .latency_ms)" >> $GITHUB_OUTPUT
@@ -285,7 +287,7 @@ jobs:
           echo "bw=$(echo $BEST | jq -r .bandwidth_quality)" >> $GITHUB_OUTPUT
 
       # ----------------------------------------------------------------
-      # 6. STORAGE LAYER: ذخیره در D1 (دقیق و بدون ارور)
+      # 6. STORAGE LAYER: D1 Integration (Zero-Error)
       # ----------------------------------------------------------------
       - name: 💾 Quantum Save to Cloudflare D1
         env:
@@ -293,7 +295,7 @@ jobs:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
         run: |
-          set -e # توقف در صورت ارور
+          set -e # Stop on error
           
           IP="${{ steps.selection.outputs.best_ip }}"
           SCORE="${{ steps.selection.outputs.score }}"
@@ -307,7 +309,7 @@ jobs:
           
           echo "Committing transaction to D1 ledger..."
           
-          # 1. ساخت جدول (اگر نباشد) - Schema دقیق
+          # 1. Create Table (If not exists) - Precise Schema
           SQL_SCHEMA="CREATE TABLE IF NOT EXISTS proxy_health (ip_port TEXT PRIMARY KEY, total_score INTEGER, latency_ms INTEGER, location TEXT, last_check INTEGER, is_healthy INTEGER, stability_percent INTEGER, jitter_ms INTEGER, download_speed_kbps INTEGER, bandwidth_quality INTEGER);"
           
           curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
@@ -315,16 +317,16 @@ jobs:
             -H "Content-Type: application/json" \
             --data "$(jq -n --arg sql "$SQL_SCHEMA" '{sql: $sql}')" > /dev/null
           
-          # 2. ذخیره داده (Upsert)
+          # 2. Save Data (Upsert Strategy)
           SQL_CMD="INSERT INTO proxy_health (ip_port, total_score, latency_ms, location, last_check, is_healthy, stability_percent, jitter_ms, download_speed_kbps, bandwidth_quality) VALUES ('$IP', $SCORE, $LAT, '$LOC', $TS, 1, $STAB, $JIT, $SPD, $BW) ON CONFLICT(ip_port) DO UPDATE SET total_score=$SCORE, latency_ms=$LAT, last_check=$TS, is_healthy=1, stability_percent=$STAB, jitter_ms=$JIT, download_speed_kbps=$SPD, bandwidth_quality=$BW;"
           
-          # ارسال درخواست
+          # Send Request
           RESP=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
             -H "Authorization: Bearer $CF_API_TOKEN" \
             -H "Content-Type: application/json" \
             --data "$(jq -n --arg sql "$SQL_CMD" '{sql: $sql}')")
             
-          # بررسی نتیجه
+          # Verify Result
           if echo "$RESP" | grep -q '"success":true'; then
             echo "✅ Data synced successfully with Quantum Precision."
           else
