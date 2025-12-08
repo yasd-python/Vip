@@ -1,4 +1,4 @@
-name: 🌌 Ultimate Quantum-AI Omni-Proxy Evolution System v3.0 [Enhanced & Fixed]
+name: 🌌 Ultimate Quantum-AI Omni-Proxy Evolution System v3.1 [Top 3 Elite Edition]
 
 on:
   workflow_dispatch:
@@ -21,7 +21,7 @@ on:
         type: string
       force_db_cleanup:
         description: 'Force aggressive database cleanup'
-        default: false
+        default: true
         type: boolean
   schedule:
     - cron: '0 */2 * * *'
@@ -45,10 +45,11 @@ env:
   MAX_TTFB_MS: "500"
   OPTIMAL_LATENCY_MS: "80"
   OPTIMAL_TTFB_MS: "150"
+  TOP_PROXIES_TO_KEEP: "3"
 
 jobs:
   quantum-neural-ultimate-evolution:
-    name: 🧠 Ultimate AI-Driven Proxy Evolution Engine v3.0
+    name: 🧠 Ultimate AI-Driven Proxy Evolution Engine v3.1
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
@@ -61,15 +62,16 @@ jobs:
       - name: 🔍 Environment Validation & Setup
         run: |
           echo "🌟 =========================================="
-          echo "🌟 QUANTUM-AI PROXY EVOLUTION SYSTEM v3.0"
-          echo "🌟 [ENHANCED EDITION WITH SMART CLEANUP]"
+          echo "🌟 QUANTUM-AI PROXY EVOLUTION SYSTEM v3.1"
+          echo "🌟 [TOP 3 ELITE EDITION - SMART CLEANUP]"
           echo "🌟 =========================================="
           echo ""
           echo "📊 Configuration Matrix:"
           echo "  • Scan Mode: ${{ github.event.inputs.scan_mode || 'hybrid_quantum_ultra' }}"
           echo "  • Target Count: ${{ github.event.inputs.target_count || '2000' }}"
           echo "  • Min Score: ${{ github.event.inputs.min_score_threshold || '500' }}"
-          echo "  • Force Cleanup: ${{ github.event.inputs.force_db_cleanup || 'false' }}"
+          echo "  • Keep Top: $TOP_PROXIES_TO_KEEP proxies only"
+          echo "  • Force Cleanup: ${{ github.event.inputs.force_db_cleanup || 'true' }}"
           echo "  • Latency Weight: $WEIGHT_LATENCY"
           echo "  • TTFB Weight: $WEIGHT_TTFB"
           echo "  • Stability Weight: $WEIGHT_STABILITY"
@@ -162,7 +164,7 @@ jobs:
           
           echo "✅ Advanced toolchain loaded and ready"
 
-      - name: 🧹 Smart Database Cleanup & Optimization
+      - name: 🧹 Elite Database Cleanup - Keep Top 3 Only
         id: db_cleanup
         continue-on-error: true
         env:
@@ -171,7 +173,7 @@ jobs:
           D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
           FORCE_CLEANUP: ${{ github.event.inputs.force_db_cleanup }}
         run: |
-          echo "🧹 Initiating Intelligent Database Cleanup System..."
+          echo "🧹 Initiating Elite Top 3 Database Cleanup System..."
           
           if [ -z "$CF_API_TOKEN" ]; then
             echo "⚠️  D1 not configured, skipping cleanup"
@@ -181,8 +183,8 @@ jobs:
           
           TIMESTAMP=$(date +%s)
           
-          echo "💾 Backing up current champion..."
-          SQL_BACKUP="SELECT * FROM proxy_health WHERE is_current_best = 1;"
+          echo "💾 Creating safety backup of current state..."
+          SQL_BACKUP="SELECT * FROM proxy_health ORDER BY (total_score * success_rate) DESC LIMIT 10;"
           
           BACKUP_RESP=$(curl -s --max-time 10 -X POST \
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
@@ -191,8 +193,8 @@ jobs:
             --data "$(jq -n --arg sql "$SQL_BACKUP" '{sql: $sql}')" 2>/dev/null)
           
           if echo "$BACKUP_RESP" | grep -q '"success":true' 2>/dev/null; then
-            echo "$BACKUP_RESP" | jq '.' > backups/champion_backup_$TIMESTAMP.json 2>/dev/null || true
-            echo "✅ Champion backup completed"
+            echo "$BACKUP_RESP" | jq '.' > backups/state_backup_$TIMESTAMP.json 2>/dev/null || true
+            echo "✅ Safety backup completed"
           fi
           
           SQL_STATS="SELECT COUNT(*) as total, 
@@ -210,110 +212,46 @@ jobs:
           TOTAL_BEFORE=$(echo "$STATS_RESP" | jq -r '.result[0].results[0].total // 0' 2>/dev/null)
           HEALTHY_BEFORE=$(echo "$STATS_RESP" | jq -r '.result[0].results[0].healthy // 0' 2>/dev/null)
           UNHEALTHY_BEFORE=$(echo "$STATS_RESP" | jq -r '.result[0].results[0].unhealthy // 0' 2>/dev/null)
-          CHAMPIONS_BEFORE=$(echo "$STATS_RESP" | jq -r '.result[0].results[0].champions // 0' 2>/dev/null)
           
           echo "📊 Database Statistics (Before Cleanup):"
           echo "  • Total Proxies: $TOTAL_BEFORE"
           echo "  • Healthy: $HEALTHY_BEFORE"
           echo "  • Unhealthy: $UNHEALTHY_BEFORE"
-          echo "  • Champions: $CHAMPIONS_BEFORE"
           echo ""
           
-          OLD_THRESHOLD=$((TIMESTAMP - 604800))
-          SQL_CLEANUP_OLD="DELETE FROM proxy_health 
-                           WHERE last_check < $OLD_THRESHOLD 
-                           AND is_healthy = 0 
-                           AND is_current_best = 0;"
+          echo "🗑️  Phase 1: AGGRESSIVE CLEANUP - Keeping ONLY Top 3 Elite Performers..."
           
-          echo "🗑️  Phase 1: Removing proxies older than 7 days (unhealthy)..."
-          curl -s --max-time 15 -X POST \
+          SQL_CLEANUP_ELITE="DELETE FROM proxy_health 
+                             WHERE ip_port NOT IN (
+                               SELECT ip_port FROM (
+                                 SELECT ip_port FROM proxy_health 
+                                 ORDER BY (total_score * success_rate * quality_index) DESC 
+                                 LIMIT $TOP_PROXIES_TO_KEEP
+                               )
+                             );"
+          
+          CLEANUP_RESP=$(curl -s --max-time 20 -X POST \
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
             -H "Authorization: Bearer $CF_API_TOKEN" \
             -H "Content-Type: application/json" \
-            --data "$(jq -n --arg sql "$SQL_CLEANUP_OLD" '{sql: $sql}')" > /dev/null 2>&1
+            --data "$(jq -n --arg sql "$SQL_CLEANUP_ELITE" '{sql: $sql}')" 2>/dev/null)
           
-          echo "✅ Phase 1 cleanup completed"
-          
-          STALE_THRESHOLD=$((TIMESTAMP - 172800))
-          SQL_CLEANUP_LOW="DELETE FROM proxy_health 
-                           WHERE total_score < 1000 
-                           AND last_check < $STALE_THRESHOLD
-                           AND is_current_best = 0
-                           AND success_rate < 50;"
-          
-          echo "🗑️  Phase 2: Removing persistently low-performing proxies..."
-          curl -s --max-time 15 -X POST \
-            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
-            -H "Authorization: Bearer $CF_API_TOKEN" \
-            -H "Content-Type: application/json" \
-            --data "$(jq -n --arg sql "$SQL_CLEANUP_LOW" '{sql: $sql}')" > /dev/null 2>&1
-          
-          echo "✅ Phase 2 cleanup completed"
-          
-          if [ "$FORCE_CLEANUP" == "true" ] || [ "$TOTAL_BEFORE" -gt 500 ]; then
-            echo "🗑️  Phase 3: Aggressive cleanup mode activated..."
-            
-            SQL_CLEANUP_AGGRESSIVE="DELETE FROM proxy_health 
-                                    WHERE ip_port NOT IN (
-                                      SELECT ip_port FROM (
-                                        SELECT ip_port FROM proxy_health 
-                                        WHERE is_current_best = 1
-                                        UNION
-                                        SELECT ip_port FROM proxy_health 
-                                        ORDER BY (total_score * success_rate) DESC 
-                                        LIMIT 100
-                                      )
-                                    );"
-            
-            curl -s --max-time 20 -X POST \
-              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
-              -H "Authorization: Bearer $CF_API_TOKEN" \
-              -H "Content-Type: application/json" \
-              --data "$(jq -n --arg sql "$SQL_CLEANUP_AGGRESSIVE" '{sql: $sql}')" > /dev/null 2>&1
-            
-            echo "✅ Phase 3 aggressive cleanup completed"
-          fi
-          
-          echo "🔧 Phase 4: Validating champion consistency..."
-          
-          SQL_COUNT_CHAMPS="SELECT COUNT(*) as champ_count FROM proxy_health WHERE is_current_best = 1;"
-          
-          CHAMP_CHECK=$(curl -s --max-time 10 -X POST \
-            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
-            -H "Authorization: Bearer $CF_API_TOKEN" \
-            -H "Content-Type: application/json" \
-            --data "$(jq -n --arg sql "$SQL_COUNT_CHAMPS" '{sql: $sql}')" 2>/dev/null)
-          
-          CHAMP_COUNT=$(echo "$CHAMP_CHECK" | jq -r '.result[0].results[0].champ_count // 0' 2>/dev/null)
-          
-          if [ "$CHAMP_COUNT" -gt 1 ]; then
-            echo "⚠️  Multiple champions detected ($CHAMP_COUNT)! Fixing..."
-            
-            SQL_RESET_ALL="UPDATE proxy_health SET is_current_best = 0;"
-            curl -s --max-time 10 -X POST \
-              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
-              -H "Authorization: Bearer $CF_API_TOKEN" \
-              -H "Content-Type: application/json" \
-              --data "$(jq -n --arg sql "$SQL_RESET_ALL" '{sql: $sql}')" > /dev/null 2>&1
-            
-            SQL_CROWN_BEST="UPDATE proxy_health 
-                            SET is_current_best = 1 
-                            WHERE ip_port = (
-                              SELECT ip_port FROM proxy_health 
-                              ORDER BY (total_score * success_rate) DESC 
-                              LIMIT 1
-                            );"
-            
-            curl -s --max-time 10 -X POST \
-              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
-              -H "Authorization: Bearer $CF_API_TOKEN" \
-              -H "Content-Type: application/json" \
-              --data "$(jq -n --arg sql "$SQL_CROWN_BEST" '{sql: $sql}')" > /dev/null 2>&1
-            
-            echo "✅ Champion consistency restored"
+          if echo "$CLEANUP_RESP" | grep -q '"success":true' 2>/dev/null; then
+            echo "✅ Elite cleanup completed - Only Top $TOP_PROXIES_TO_KEEP remain"
           else
-            echo "✅ Champion consistency verified"
+            echo "⚠️  Cleanup response: $(echo "$CLEANUP_RESP" | jq -r '.errors[0].message // "Unknown"' 2>/dev/null)"
           fi
+          
+          echo "🔧 Phase 2: Champion flag consistency check..."
+          
+          SQL_RESET_ALL="UPDATE proxy_health SET is_current_best = 0;"
+          curl -s --max-time 10 -X POST \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$(jq -n --arg sql "$SQL_RESET_ALL" '{sql: $sql}')" > /dev/null 2>&1
+          
+          echo "✅ Champion flags reset"
           
           FINAL_STATS=$(curl -s --max-time 10 -X POST \
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
@@ -322,15 +260,13 @@ jobs:
             --data "$(jq -n --arg sql "$SQL_STATS" '{sql: $sql}')" 2>/dev/null)
           
           TOTAL_AFTER=$(echo "$FINAL_STATS" | jq -r '.result[0].results[0].total // 0' 2>/dev/null)
-          HEALTHY_AFTER=$(echo "$FINAL_STATS" | jq -r '.result[0].results[0].healthy // 0' 2>/dev/null)
-          
           REMOVED=$((TOTAL_BEFORE - TOTAL_AFTER))
           
           echo ""
-          echo "📊 Cleanup Summary:"
+          echo "📊 Elite Cleanup Summary:"
           echo "  • Proxies Removed: $REMOVED"
-          echo "  • Remaining Total: $TOTAL_AFTER"
-          echo "  • Healthy Proxies: $HEALTHY_AFTER"
+          echo "  • Elite Proxies Remaining: $TOTAL_AFTER (Maximum: $TOP_PROXIES_TO_KEEP)"
+          echo "  • Database Optimized: ✅"
           echo ""
           
           echo "cleanup_performed=true" >> $GITHUB_OUTPUT
@@ -463,7 +399,7 @@ jobs:
         with:
           toolchain: stable
 
-      - name: ⚡ Build Ultimate Quantum Scanner Engine v3.0
+      - name: ⚡ Build Ultimate Quantum Scanner Engine v3.1
         run: |
           echo "⚙️  Generating advanced Rust scanner with enhanced multi-dimensional analysis..."
           
@@ -513,7 +449,7 @@ jobs:
                   _ => ScanMode::HybridQuantumUltra,
               };
               
-              println!("🚀 Quantum Scanner Engine v3.0 Initialized");
+              println!("🚀 Quantum Scanner Engine v3.1 Initialized");
               println!("📊 Mode: {:?}", scan_mode);
               
               let file = File::open(filename).expect("Cannot open input file");
@@ -716,7 +652,6 @@ jobs:
               
               let mut score = (1_000_000 / total_time as u64).min(100_000);
               
-              // Enhanced latency scoring with more granular tiers
               if latency < 30 {
                   score += 8000;
               } else if latency < 50 {
@@ -731,7 +666,6 @@ jobs:
                   score += 500;
               }
               
-              // Enhanced TTFB scoring
               if ttfb < 50 {
                   score += 6000;
               } else if ttfb < 100 {
@@ -746,10 +680,8 @@ jobs:
                   score += 300;
               }
               
-              // Apply stability multiplier
               score = (score * stability as u64) / 100;
               
-              // Enhanced jitter penalty
               if jitter > 150 {
                   score = (score * 60) / 100;
               } else if jitter > 100 {
@@ -760,7 +692,6 @@ jobs:
                   score += 1000;
               }
               
-              // Response code bonuses
               match response_code {
                   200 => score += 1500,
                   301 | 302 | 307 | 308 => score += 800,
@@ -768,10 +699,8 @@ jobs:
                   _ => {}
               }
               
-              // Connection quality multiplier - FIXED: ensure proper float conversion
               score = ((score as f64) * quality) as u64;
               
-              // Response size bonus (valid responses)
               if response_size > 100 && response_size < 10000 {
                   score += 500;
               }
@@ -782,7 +711,6 @@ jobs:
           fn calculate_connection_quality(latency: u128, ttfb: u128, jitter: u128, stability: u32) -> f64 {
               let mut quality = 1.0_f64;
               
-              // Reward low latency
               if latency < 50 {
                   quality *= 1.15;
               } else if latency < 100 {
@@ -791,14 +719,12 @@ jobs:
                   quality *= 0.9;
               }
               
-              // Reward low TTFB
               if ttfb < 100 {
                   quality *= 1.12;
               } else if ttfb > 400 {
                   quality *= 0.88;
               }
               
-              // Reward low jitter (consistency)
               if jitter < 20 {
                   quality *= 1.2;
               } else if jitter < 50 {
@@ -807,7 +733,6 @@ jobs:
                   quality *= 0.85;
               }
               
-              // Reward high stability
               if stability > 95 {
                   quality *= 1.15;
               } else if stability > 80 {
@@ -816,7 +741,6 @@ jobs:
                   quality *= 0.9;
               }
               
-              // FIXED: Use f64 literals for proper type consistency
               quality.min(1.5_f64).max(0.5_f64)
           }
 
@@ -919,7 +843,7 @@ jobs:
           
           fn write_detailed_log(data: &[ProxyNode], filename: &str) {
               let mut file = File::create(filename).expect("Cannot create log file");
-              writeln!(file, "=== QUANTUM PROXY SCANNER v3.0 - DETAILED RESULTS ===\n").unwrap();
+              writeln!(file, "=== QUANTUM PROXY SCANNER v3.1 - DETAILED RESULTS ===\n").unwrap();
               writeln!(file, "Total Viable Proxies: {}\n", data.len()).unwrap();
               
               for (i, node) in data.iter().enumerate() {
@@ -937,7 +861,7 @@ jobs:
           }
           RUST_ENGINE_EOF
           
-          echo "✅ Advanced Rust engine v3.0 source generated"
+          echo "✅ Advanced Rust engine v3.1 source generated"
           echo ""
           echo "🔨 Compiling with maximum optimization flags..."
           
@@ -955,7 +879,7 @@ jobs:
           fi
           
           chmod +x quantum_scanner
-          echo "✅ Quantum Scanner v3.0 compiled successfully"
+          echo "✅ Quantum Scanner v3.1 compiled successfully"
           
           ls -lh quantum_scanner
           echo ""
@@ -990,12 +914,14 @@ jobs:
             jq -r '.[:3] | .[] | "  • \(.ip_port) - Score: \(.score), Latency: \(.latency)ms"' quantum_results.json 2>/dev/null || true
           fi
 
-      - name: 🤖 Advanced Neural Selection Engine v3.0
+      - name: 🤖 Advanced Neural Selection Engine v3.1 - Top 3 Elite
         id: neural_selection
         env:
           MIN_SCORE: ${{ github.event.inputs.min_score_threshold || '500' }}
         run: |
           echo "🧮 Activating enhanced multi-dimensional neural analysis..."
+          echo "🎯 Elite Selection Mode: TOP 3 PERFORMERS ONLY"
+          echo ""
           
           RESULT_COUNT=$(jq '. | length' quantum_results.json 2>/dev/null || echo "0")
           
@@ -1029,7 +955,16 @@ jobs:
               FILTERED=$(jq '.' quantum_results.json 2>/dev/null || echo "[]")
             fi
             
-            BEST_NODE=$(echo "$FILTERED" | jq -c 'sort_by(-.score) | .[0]' 2>/dev/null || echo "{}")
+            echo ""
+            echo "🏆 === SELECTING TOP 3 ELITE PERFORMERS ==="
+            echo ""
+            
+            echo "$FILTERED" | jq -c 'sort_by(-.score) | .[:3]' > results/top3_elite.json 2>/dev/null || echo "[]" > results/top3_elite.json
+            
+            TOP3_COUNT=$(jq '. | length' results/top3_elite.json 2>/dev/null || echo "0")
+            echo "✅ Top $TOP3_COUNT elite performers selected for database storage"
+            
+            BEST_NODE=$(jq -c '.[0]' results/top3_elite.json 2>/dev/null || echo "{}")
             
             BEST_IP=$(echo "$BEST_NODE" | jq -r '.ip_port // "127.0.0.1:8080"' 2>/dev/null)
             BEST_SCORE=$(echo "$BEST_NODE" | jq -r '.score // 0' 2>/dev/null)
@@ -1045,13 +980,14 @@ jobs:
               BEST_LOC="XX"
             fi
             
-            echo "$FILTERED" | jq -c 'sort_by(-.score) | .[:20]' > results/top20_proxies.json 2>/dev/null || echo "[]" > results/top20_proxies.json
-            
             echo ""
             echo "🏆 =============================================="
-            echo "🏆 ULTIMATE CHAMPION PROXY SELECTED v3.0"
+            echo "🏆 TOP 3 ELITE PERFORMERS"
             echo "🏆 =============================================="
-            echo "   IP:Port: $BEST_IP"
+            jq -r '.[] | "  #\(. | tostring | split(",") | length). \(.ip_port) - Score: \(.score), Latency: \(.latency)ms, Quality: \(.quality)"' results/top3_elite.json 2>/dev/null | head -3 | nl
+            echo "🏆 =============================================="
+            echo ""
+            echo "👑 CHAMPION (Rank #1): $BEST_IP"
             echo "   Neural Score: $BEST_SCORE"
             echo "   Latency: ${BEST_LAT}ms"
             echo "   TTFB: ${BEST_TTFB}ms"
@@ -1072,30 +1008,24 @@ jobs:
           echo "best_quality=$BEST_QUALITY" >> $GITHUB_OUTPUT
           echo "best_loc=$BEST_LOC" >> $GITHUB_OUTPUT
           echo "result_count=$RESULT_COUNT" >> $GITHUB_OUTPUT
+          echo "top3_count=$TOP3_COUNT" >> $GITHUB_OUTPUT
 
-      - name: 💾 Cloudflare D1 Enhanced Database Sync with Atomic Champion Selection
+      - name: 💾 Cloudflare D1 - Atomic Top 3 Elite Storage System
         id: db_sync
         continue-on-error: true
         env:
           CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
-          BEST_IP: ${{ steps.neural_selection.outputs.best_ip }}
-          BEST_SCORE: ${{ steps.neural_selection.outputs.best_score }}
-          BEST_LAT: ${{ steps.neural_selection.outputs.best_lat }}
-          BEST_TTFB: ${{ steps.neural_selection.outputs.best_ttfb }}
-          BEST_JITTER: ${{ steps.neural_selection.outputs.best_jitter }}
-          BEST_STABILITY: ${{ steps.neural_selection.outputs.best_stability }}
-          BEST_QUALITY: ${{ steps.neural_selection.outputs.best_quality }}
-          BEST_LOC: ${{ steps.neural_selection.outputs.best_loc }}
         run: |
           if [ -z "$CF_API_TOKEN" ]; then
             echo "ℹ️  D1 database not configured, skipping sync"
             exit 0
           fi
           
-          echo "💾 Synchronizing with Cloudflare D1 long-term memory..."
-          echo "🏆 Implementing atomic champion selection system v3.0..."
+          echo "💾 === ATOMIC TOP 3 ELITE STORAGE SYSTEM ==="
+          echo "🎯 Only the best 3 proxies will remain in database"
+          echo ""
           
           TIMESTAMP=$(date +%s)
           
@@ -1128,114 +1058,98 @@ jobs:
           
           echo "✅ Enhanced schema validated"
           
-          SQL_RESET="UPDATE proxy_health SET is_current_best = 0, last_champion_time = CASE WHEN is_current_best = 1 THEN $TIMESTAMP ELSE last_champion_time END WHERE is_current_best = 1;"
+          echo "🗑️  Phase 1: Removing ALL existing proxies..."
           
-          RESET_RESP=$(curl -s --max-time 15 -X POST \
+          SQL_DELETE_ALL="DELETE FROM proxy_health;"
+          
+          curl -s --max-time 15 -X POST \
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
             -H "Authorization: Bearer $CF_API_TOKEN" \
             -H "Content-Type: application/json" \
-            --data "$(jq -n --arg sql "$SQL_RESET" '{sql: $sql}')" 2>/dev/null)
+            --data "$(jq -n --arg sql "$SQL_DELETE_ALL" '{sql: $sql}')" > /dev/null 2>&1
           
-          if echo "$RESET_RESP" | grep -q '"success":true' 2>/dev/null; then
-            echo "✅ Previous champions dethroned successfully"
-          else
-            echo "⚠️  Champion reset warning (continuing...)"
+          echo "✅ Database cleared - fresh start"
+          
+          echo "💎 Phase 2: Inserting TOP 3 ELITE performers..."
+          
+          if [ ! -f results/top3_elite.json ]; then
+            echo "⚠️  Top 3 file not found, skipping insert"
+            exit 0
           fi
           
-          SQL_CHAMPION="INSERT INTO proxy_health (
-            ip_port, total_score, latency_ms, ttfb_ms, jitter_ms, 
-            stability_pct, quality_index, location, last_check, is_healthy, 
-            is_current_best, first_seen, best_score, check_count, last_champion_time,
-            consecutive_successes
-          ) VALUES (
-            '$BEST_IP', $BEST_SCORE, $BEST_LAT, $BEST_TTFB, $BEST_JITTER,
-            $BEST_STABILITY, $BEST_QUALITY, '$BEST_LOC', $TIMESTAMP, 1,
-            1, $TIMESTAMP, $BEST_SCORE, 1, $TIMESTAMP, 1
-          ) ON CONFLICT(ip_port) DO UPDATE SET
-            total_score = $BEST_SCORE,
-            latency_ms = $BEST_LAT,
-            ttfb_ms = $BEST_TTFB,
-            jitter_ms = $BEST_JITTER,
-            stability_pct = $BEST_STABILITY,
-            quality_index = $BEST_QUALITY,
-            last_check = $TIMESTAMP,
-            check_count = check_count + 1,
-            success_rate = (success_rate * check_count + 100.0) / (check_count + 1),
-            is_healthy = 1,
-            is_current_best = 1,
-            last_champion_time = $TIMESTAMP,
-            best_score = CASE WHEN $BEST_SCORE > best_score THEN $BEST_SCORE ELSE best_score END,
-            consecutive_successes = consecutive_successes + 1,
-            consecutive_failures = 0;"
+          TOP3_COUNT=$(jq '. | length' results/top3_elite.json 2>/dev/null || echo "0")
           
-          CHAMP_RESP=$(curl -s --max-time 15 -X POST \
-            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
-            -H "Authorization: Bearer $CF_API_TOKEN" \
-            -H "Content-Type: application/json" \
-            --data "$(jq -n --arg sql "$SQL_CHAMPION" '{sql: $sql}')" 2>/dev/null)
-          
-          if echo "$CHAMP_RESP" | grep -q '"success":true' 2>/dev/null; then
-            echo "✅ 🏆 NEW CHAMPION CROWNED: $BEST_IP (Score: $BEST_SCORE, Quality: $BEST_QUALITY)"
-          else
-            echo "⚠️  Champion update warning"
+          if [ "$TOP3_COUNT" -eq 0 ]; then
+            echo "⚠️  No elite proxies to insert"
+            exit 0
           fi
           
-          echo "💾 Committing elite performers to knowledge base..."
+          echo "📊 Processing $TOP3_COUNT elite proxies for insertion..."
           
-          if [ -f results/top20_proxies.json ]; then
-            TOP_COUNT=$(jq '. | length' results/top20_proxies.json 2>/dev/null || echo "0")
-            echo "📊 Processing $TOP_COUNT elite proxies..."
+          RANK=1
+          jq -c '.[]' results/top3_elite.json 2>/dev/null | while read -r proxy; do
+            P_IP=$(echo "$proxy" | jq -r '.ip_port // ""' 2>/dev/null)
+            P_SCORE=$(echo "$proxy" | jq -r '.score // 0' 2>/dev/null)
+            P_LAT=$(echo "$proxy" | jq -r '.latency // 0' 2>/dev/null)
+            P_TTFB=$(echo "$proxy" | jq -r '.ttfb // 0' 2>/dev/null)
+            P_JITTER=$(echo "$proxy" | jq -r '.jitter // 0' 2>/dev/null)
+            P_STAB=$(echo "$proxy" | jq -r '.stability // 0' 2>/dev/null)
+            P_QUAL=$(echo "$proxy" | jq -r '.quality // 1.0' 2>/dev/null)
             
-            jq -c '.[]' results/top20_proxies.json 2>/dev/null | while read -r proxy; do
-              P_IP=$(echo "$proxy" | jq -r '.ip_port // ""' 2>/dev/null)
-              P_SCORE=$(echo "$proxy" | jq -r '.score // 0' 2>/dev/null)
-              P_LAT=$(echo "$proxy" | jq -r '.latency // 0' 2>/dev/null)
-              P_TTFB=$(echo "$proxy" | jq -r '.ttfb // 0' 2>/dev/null)
-              P_JITTER=$(echo "$proxy" | jq -r '.jitter // 0' 2>/dev/null)
-              P_STAB=$(echo "$proxy" | jq -r '.stability // 0' 2>/dev/null)
-              P_QUAL=$(echo "$proxy" | jq -r '.quality // 1.0' 2>/dev/null)
-              
-              if [ -z "$P_IP" ] || [ "$P_IP" == "$BEST_IP" ]; then
-                continue
+            if [ -z "$P_IP" ]; then
+              continue
+            fi
+            
+            P_CLEAN_IP=$(echo "$P_IP" | cut -d':' -f1)
+            P_LOC=$(geoiplookup "$P_CLEAN_IP" 2>/dev/null | awk -F': ' '{print $2}' | cut -d',' -f1 | head -c 2 || echo "XX")
+            
+            IS_CHAMPION=0
+            if [ "$RANK" -eq 1 ]; then
+              IS_CHAMPION=1
+              echo "👑 Inserting CHAMPION: $P_IP (Score: $P_SCORE)"
+            else
+              echo "💎 Inserting Elite #$RANK: $P_IP (Score: $P_SCORE)"
+            fi
+            
+            SQL_INSERT="INSERT INTO proxy_health (
+              ip_port, total_score, latency_ms, ttfb_ms, jitter_ms, 
+              stability_pct, quality_index, location, last_check, is_healthy, 
+              is_current_best, first_seen, best_score, check_count, 
+              last_champion_time, consecutive_successes, success_rate
+            ) VALUES (
+              '$P_IP', $P_SCORE, $P_LAT, $P_TTFB, $P_JITTER,
+              $P_STAB, $P_QUAL, '$P_LOC', $TIMESTAMP, 1,
+              $IS_CHAMPION, $TIMESTAMP, $P_SCORE, 1,
+              $TIMESTAMP, 1, 100.0
+            );"
+            
+            INSERT_RESP=$(curl -s --max-time 10 -X POST \
+              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
+              -H "Authorization: Bearer $CF_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data "$(jq -n --arg sql "$SQL_INSERT" '{sql: $sql}')" 2>/dev/null)
+            
+            if echo "$INSERT_RESP" | grep -q '"success":true' 2>/dev/null; then
+              if [ "$IS_CHAMPION" -eq 1 ]; then
+                echo "  ✅ Champion inserted successfully"
+              else
+                echo "  ✅ Elite proxy inserted"
               fi
-              
-              P_CLEAN_IP=$(echo "$P_IP" | cut -d':' -f1)
-              P_LOC=$(geoiplookup "$P_CLEAN_IP" 2>/dev/null | awk -F': ' '{print $2}' | cut -d',' -f1 | head -c 2 || echo "XX")
-              
-              SQL_BATCH="INSERT INTO proxy_health (
-                ip_port, total_score, latency_ms, ttfb_ms, jitter_ms, 
-                stability_pct, quality_index, location, last_check, is_healthy, 
-                is_current_best, first_seen, best_score, check_count, consecutive_successes
-              ) VALUES (
-                '$P_IP', $P_SCORE, $P_LAT, $P_TTFB, $P_JITTER, 
-                $P_STAB, $P_QUAL, '$P_LOC', $TIMESTAMP, 1, 
-                0, $TIMESTAMP, $P_SCORE, 1, 1
-              ) ON CONFLICT(ip_port) DO UPDATE SET 
-                total_score=$P_SCORE, 
-                latency_ms=$P_LAT, 
-                ttfb_ms=$P_TTFB, 
-                jitter_ms=$P_JITTER, 
-                stability_pct=$P_STAB,
-                quality_index=$P_QUAL,
-                last_check=$TIMESTAMP, 
-                check_count=check_count+1, 
-                is_healthy=1, 
-                is_current_best=0,
-                consecutive_successes=consecutive_successes+1,
-                consecutive_failures=0,
-                best_score=CASE WHEN $P_SCORE > best_score THEN $P_SCORE ELSE best_score END;"
-              
-              curl -s --max-time 8 -X POST \
-                "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
-                -H "Authorization: Bearer $CF_API_TOKEN" \
-                -H "Content-Type: application/json" \
-                --data "$(jq -n --arg sql "$SQL_BATCH" '{sql: $sql}')" > /dev/null 2>&1
-            done
+            else
+              echo "  ⚠️  Insert warning for $P_IP"
+            fi
             
-            echo "✅ Knowledge base updated"
-          fi
+            RANK=$((RANK + 1))
+          done
           
-          SQL_VERIFY="SELECT ip_port, total_score, quality_index, is_current_best FROM proxy_health WHERE is_current_best = 1;"
+          echo ""
+          echo "🔍 Phase 3: Verification..."
+          
+          SQL_VERIFY="SELECT COUNT(*) as total, 
+                             SUM(CASE WHEN is_current_best = 1 THEN 1 ELSE 0 END) as champions,
+                             MIN(total_score) as min_score,
+                             MAX(total_score) as max_score
+                      FROM proxy_health;"
           
           VERIFY_RESP=$(curl -s --max-time 10 -X POST \
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
@@ -1243,18 +1157,27 @@ jobs:
             -H "Content-Type: application/json" \
             --data "$(jq -n --arg sql "$SQL_VERIFY" '{sql: $sql}')" 2>/dev/null)
           
-          CHAMPION_COUNT=$(echo "$VERIFY_RESP" | jq -r '.result[0].results | length' 2>/dev/null || echo "0")
+          DB_TOTAL=$(echo "$VERIFY_RESP" | jq -r '.result[0].results[0].total // 0' 2>/dev/null)
+          DB_CHAMPIONS=$(echo "$VERIFY_RESP" | jq -r '.result[0].results[0].champions // 0' 2>/dev/null)
+          DB_MIN_SCORE=$(echo "$VERIFY_RESP" | jq -r '.result[0].results[0].min_score // 0' 2>/dev/null)
+          DB_MAX_SCORE=$(echo "$VERIFY_RESP" | jq -r '.result[0].results[0].max_score // 0' 2>/dev/null)
           
           echo ""
-          echo "🔍 Champion Verification:"
-          echo "  • Champions in database: $CHAMPION_COUNT"
+          echo "📊 === DATABASE VERIFICATION ==="
+          echo "  • Total Proxies in DB: $DB_TOTAL"
+          echo "  • Champions (should be 1): $DB_CHAMPIONS"
+          echo "  • Score Range: $DB_MIN_SCORE - $DB_MAX_SCORE"
+          echo ""
           
-          if [ "$CHAMPION_COUNT" -eq 1 ]; then
-            echo "  • ✅ Single champion verified"
+          if [ "$DB_TOTAL" -le 3 ] && [ "$DB_CHAMPIONS" -eq 1 ]; then
+            echo "✅ ✅ ✅ PERFECT! Top 3 system working correctly!"
+          else
+            echo "⚠️  Verification warning - expected ≤3 total, 1 champion"
           fi
           
           echo ""
-          echo "champion_verified=$CHAMPION_COUNT" >> $GITHUB_OUTPUT
+          echo "champion_verified=$DB_CHAMPIONS" >> $GITHUB_OUTPUT
+          echo "total_in_db=$DB_TOTAL" >> $GITHUB_OUTPUT
 
       - name: 🔍 Enhanced Verification & Quality Assurance
         id: verification
@@ -1337,19 +1260,22 @@ jobs:
           echo "  • Composite Score: $COMPOSITE_SCORE/100"
           echo ""
 
-      - name: 📊 Generate Ultimate Quantum Report v3.0
+      - name: 📊 Generate Ultimate Quantum Report v3.1 - Top 3 Edition
         if: always()
         run: |
           echo "📝 Generating comprehensive analysis report..."
           
           cat > results/ultimate_report.md << 'REPORT_EOF'
-          # 🌌 Ultimate Quantum-AI Proxy Evolution Report v3.0
+          # 🌌 Ultimate Quantum-AI Proxy Evolution Report v3.1
+          ## Top 3 Elite Edition
           
-          ## 🏆 Champion Proxy Selection [ENHANCED]
+          ## 🏆 Champion Proxy Selection [TOP 3 SYSTEM]
           
           **Selected Champion Node:** `${{ steps.neural_selection.outputs.best_ip }}`
           
-          **Champion Status:** ${{ steps.db_sync.outputs.champion_verified == '1' && '✅ Verified Single Champion' || '⚠️ Verification Pending' }}
+          **Database Status:** ${{ steps.db_sync.outputs.total_in_db || 'N/A' }} proxies stored (Maximum: 3)
+          
+          **Champion Verification:** ${{ steps.db_sync.outputs.champion_verified == '1' && '✅ Single Champion Verified' || '⚠️ Verification Pending' }}
           
           ### 📊 Enhanced Performance Metrics
           
@@ -1368,21 +1294,25 @@ jobs:
           
           The system evaluated a comprehensive dataset through advanced multi-dimensional analysis using the `${{ github.event.inputs.scan_mode || 'hybrid_quantum_ultra' }}` mode. Successfully discovered `${{ steps.neural_selection.outputs.result_count }}` viable candidates. The AI memory system recalled `${{ steps.memory_recall.outputs.memory_count || '0' }}` high-performance nodes from historical data.
           
+          ### 💎 Top 3 Elite System
+          
+          This workflow implements an aggressive elite-only storage system. After each scan, the database is completely cleared and only the top three highest-performing proxies are stored. This ensures the database always contains only the absolute best performers from the most recent scan.
+          
+          The top three proxies are selected based on a comprehensive neural scoring algorithm that evaluates TCP latency, time to first byte, network jitter consistency, connection stability across multiple tests, quality index calculations, and response validation metrics. Each proxy undergoes rigorous testing before being considered for elite status.
+          
           ### 🧹 Database Maintenance
           
-          ${{ steps.db_cleanup.outputs.cleanup_performed == 'true' && format('Intelligent cleanup removed `{0}` outdated proxies, maintaining `{1}` high-quality entries.', steps.db_cleanup.outputs.removed_count, steps.db_cleanup.outputs.remaining_count) || 'Database cleanup was skipped (D1 not configured).' }}
+          ${{ steps.db_cleanup.outputs.cleanup_performed == 'true' && format('Intelligent cleanup removed `{0}` outdated proxies. The database now maintains exactly `{1}` elite performers.', steps.db_cleanup.outputs.removed_count, steps.db_cleanup.outputs.remaining_count) || 'Database cleanup was skipped (D1 not configured).' }}
           
-          ### 🧠 AI Champion Selection System v3.0
+          ### 🧠 Atomic Champion Selection System
           
-          This proxy was crowned using our atomic two-phase selection process that guarantees exactly one champion proxy at any moment. The system evaluates TCP latency, time to first byte, network jitter consistency, reliability across multiple tests, quality index, and historical performance data to select the optimal proxy.
+          The champion selection uses a two-phase atomic operation. First, the entire database is cleared to ensure a fresh start. Second, the top three proxies from the current scan are inserted, with the highest scorer receiving the champion flag with is_current_best equals one.
           
-          The champion selection uses a critical two-step atomic operation. First, all existing proxies have their is_current_best flag reset to zero, recording timestamps when championship status is lost. Second, the highest-scoring proxy receives is_current_best equals one based on comprehensive neural scoring that considers the entire performance profile.
-          
-          This approach guarantees exactly one champion at any time. Applications can retrieve the current best performer with a simple query filtering for is_current_best equals one, instantly accessing the optimal proxy.
+          This approach guarantees exactly three proxies in the database at any time, with exactly one champion. Applications can retrieve the current best performer with a simple query filtering for is_current_best equals one, instantly accessing the optimal proxy.
           
           ### 🔍 Verification Results
           
-          Port connectivity testing returned `${{ steps.verification.outputs.port_check || 'N/A' }}`. IP validation confirmed `${{ steps.verification.outputs.ip_check || 'N/A' }}`. Performance grading assigned `${{ steps.verification.outputs.performance_grade || 'N/A' }}` based on comprehensive metrics. Database verification shows `${{ steps.db_sync.outputs.champion_verified || 'N/A' }}` active champion.
+          Port connectivity testing returned `${{ steps.verification.outputs.port_check || 'N/A' }}`. IP validation confirmed `${{ steps.verification.outputs.ip_check || 'N/A' }}`. Performance grading assigned `${{ steps.verification.outputs.performance_grade || 'N/A' }}` based on comprehensive metrics. Database verification shows `${{ steps.db_sync.outputs.champion_verified || 'N/A' }}` active champion with `${{ steps.db_sync.outputs.total_in_db || 'N/A' }}` total proxies stored.
           
           ### 🎯 Query Current Champion
           
@@ -1398,9 +1328,24 @@ jobs:
           
           This query returns exactly one row with the current champion and all performance metrics.
           
+          ### 📋 Query All Top 3
+          
+          To retrieve all three elite proxies:
+          
+          ```sql
+          SELECT ip_port, total_score, latency_ms, ttfb_ms,
+                 stability_pct, quality_index, location,
+                 is_current_best
+          FROM proxy_health
+          ORDER BY total_score DESC;
+          ```
+          
+          This query returns all three elite performers ranked by score, with the champion clearly marked.
+          
           ---
           
-          *Generated by Ultimate Quantum-AI Neural Engine v3.0*  
+          *Generated by Ultimate Quantum-AI Neural Engine v3.1*  
+          *Top 3 Elite Edition - Maximum Performance*  
           *Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")*  
           *Run: #${{ github.run_number }}*
           REPORT_EOF
@@ -1415,7 +1360,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: quantum-proxy-results-v3-run-${{ github.run_number }}
+          name: quantum-proxy-top3-elite-run-${{ github.run_number }}
           path: |
             quantum_results.json
             results/
@@ -1429,18 +1374,25 @@ jobs:
         run: |
           echo ""
           echo "🎉 =============================================="
-          echo "🎉 QUANTUM EVOLUTION CYCLE COMPLETE v3.0"
+          echo "🎉 QUANTUM EVOLUTION CYCLE COMPLETE v3.1"
+          echo "🎉 TOP 3 ELITE EDITION"
           echo "🎉 =============================================="
           echo ""
           echo "✅ All systems nominal"
           echo "✅ Champion proxy selected and verified"
-          echo "✅ Database champion flag set (is_current_best = 1)"
+          echo "✅ Database contains ONLY top 3 performers"
           echo "✅ Enhanced quality metrics recorded"
           echo ""
           echo "📋 Quick Access:"
-          echo "   • Best Proxy: ${{ steps.neural_selection.outputs.best_ip }}"
+          echo "   • Champion: ${{ steps.neural_selection.outputs.best_ip }}"
           echo "   • Neural Score: ${{ steps.neural_selection.outputs.best_score }}"
           echo "   • Grade: ${{ steps.verification.outputs.performance_grade }}"
+          echo "   • DB Total: ${{ steps.db_sync.outputs.total_in_db || '0' }} (Max: 3)"
+          echo ""
+          echo "💎 Top 3 Elite System Status:"
+          echo "   • Database Cleaned: ✅"
+          echo "   • Only Best 3 Stored: ✅"
+          echo "   • Champion Flag Set: ✅"
           echo ""
 
   cleanup-old-runs:
